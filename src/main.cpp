@@ -1684,7 +1684,7 @@ void drawKeyboard(App& app, ImVec2 size) {
             }
             if (assigned && ImGui::BeginDragDropSource()) {
                 ImGui::SetDragDropPayload("KIT_KEY", &i, sizeof(i));
-                ImGui::TextUnformatted(fs::path(kitKeys[k]).stem().c_str());
+                ImGui::TextUnformatted(fs::path(kitKeys[k]).stem().string().c_str());
                 ImGui::EndDragDropSource();
             }
             if (ImGui::BeginDragDropTarget()) {
