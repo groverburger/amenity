@@ -72,6 +72,56 @@ void quantizeAll(Timeline& timeline, double grid) {
     timeline.events = std::move(kept);
 }
 
+void removeDuplicates(Timeline& timeline) {
+    std::vector<TimelineEvent> kept;
+    kept.reserve(timeline.events.size());
+    for (TimelineEvent& event : timeline.events) {
+        const bool duplicate = std::any_of(kept.begin(), kept.end(), [&](const TimelineEvent& other) {
+            return sameSound(other, event) && std::fabs(other.beat - event.beat) < kSameBeat;
+        });
+        if (!duplicate) kept.push_back(std::move(event));
+    }
+    timeline.events = std::move(kept);
+}
+
+std::vector<TimelineEvent> copyEvents(const Timeline& timeline, const std::set<uint64_t>& ids) {
+    std::vector<TimelineEvent> clip;
+    for (const TimelineEvent& event : timeline.events) {
+        if (ids.count(event.id)) clip.push_back(event);
+    }
+    if (clip.empty()) return clip;
+    double first = clip.front().beat;
+    for (const TimelineEvent& event : clip) first = std::min(first, event.beat);
+    for (TimelineEvent& event : clip) {
+        event.beat -= first;
+        event.id = 0;
+    }
+    std::stable_sort(clip.begin(), clip.end(), [](const TimelineEvent& a, const TimelineEvent& b) { return a.beat < b.beat; });
+    return clip;
+}
+
+std::vector<uint64_t> pasteEvents(Timeline& timeline, const std::vector<TimelineEvent>& clip, double atBeat) {
+    std::vector<uint64_t> added;
+    const double loop = timeline.loopBeats();
+    for (TimelineEvent event : clip) {
+        event.beat += atBeat;
+        if (event.beat < 0.0 || event.beat >= loop - kSameBeat) continue;
+        // A loop that ran to the end of the timeline still does, from its new place.
+        if (event.durationBeats > 0.0) event.durationBeats = std::min(event.durationBeats, loop - event.beat);
+        const uint64_t id = addHit(timeline, std::move(event));
+        if (id != 0) added.push_back(id);
+    }
+    return added;
+}
+
+double musicalLength(double beats) {
+    if (beats <= 0.0) return 0.0;
+    if (beats > kBeatsPerBar) return std::ceil(beats / kBeatsPerBar - 1e-9) * kBeatsPerBar;
+    double length = 1.0 / 16.0;
+    while (length < beats - 1e-9) length *= 2.0;
+    return length;
+}
+
 bool saveSession(const Session& session, const std::string& path) {
     std::ostringstream out;
     out.precision(17);
@@ -82,6 +132,7 @@ bool saveSession(const Session& session, const std::string& path) {
     out << "quantize\t" << session.quantizeIndex << '\n';
     out << "metronome\t" << (session.metronome ? 1 : 0) << '\n';
     if (!session.song.empty()) out << "song\t" << session.song << '\n';
+    if (!session.editingLoop.empty()) out << "editingLoop\t" << session.editingLoop << '\n';
     out << "currentKit\t" << session.currentKit << '\n';
     for (const Kit& kit : session.kits) {
         out << "kitName\t" << kit.name << '\n';  // the key lines after it belong to this kit
@@ -141,6 +192,8 @@ bool loadSession(Session& session, const std::string& path, uint32_t targetRate,
             loaded.metronome = std::atoi(value.c_str()) != 0;
         } else if (key == "song") {
             loaded.song = value;
+        } else if (key == "editingLoop") {
+            loaded.editingLoop = value;
         } else if (key == "kit") {
             const auto fields = splitFields(value, 2);
             if (fields.size() != 2) continue;

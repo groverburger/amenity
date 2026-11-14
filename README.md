@@ -27,12 +27,26 @@ Supported formats: WAV, MP3, FLAC, AIFF, M4A, AAC.
 4. **Record:** set the BPM, bars and snap, then press `Return`. After a one-bar count-in,
    everything you play lands on the timeline, snapped to the grid. It loops so you can
    keep layering. Press `Return` again to stop recording while it keeps playing.
-5. **Save:** **Save loop** renders one pass as a new sound you can play or even chop.
+5. **Save:** **Save loop** renders one pass as a new sound you can play or even chop. Its
+   hits are saved with it, so you can change it later: press **Edit** next to it under
+   **Sounds** to put them back on the timeline, then **Save loop** again to update it.
+   Kits and anything else using the loop get the new version, and Cmd+Z puts back whatever
+   was on the timeline before you opened it.
 
 **Placing without recording:** press `'` for Place mode. Each key you press drops its sound
 at the cursor and moves on by the snap value. `Left` and `Right` move the cursor, which also
 makes rests, and clicking the timeline sets it. Double-clicking a lane adds another hit of
 that sound.
+
+**Moving and copying hits:** click a hit to select it, Shift-click to add more, or drag across
+empty space to select everything you drag over. Clicking a lane's name selects all of that
+sound's hits. Drag to move the selection, or hold Option while you drag to copy it instead.
+Cmd+D repeats the selection straight after itself, which is quick for turning one bar into
+four. Cmd+C copies and Cmd+V pastes at the cursor (the orange line), then moves the cursor on,
+so pasting again lays the copies end to end. Right-click for the same commands.
+
+**Where playback starts:** Space plays from the blue marker on the ruler. Click the ruler to
+move it, and right-click the ruler to put it back at the beginning.
 
 **Looping a break to your BPM:** press **Bookmark song**, select it under **Sounds**, then
 turn on **Loop** and **Fit to BPM**. Press its key to start it and again to stop it.
@@ -62,6 +76,10 @@ settings of its own effect.
 Changes render in the background and apply from the next hit, so a sound that's already
 ringing finishes as it was.
 
+A loop never has silence added to it. If a sound is a little short of a whole number of bars
+at its BPM, it's treated as exactly that many bars, played a touch faster. Other lengths are
+trimmed to the nearest 16th note, and a loop with no BPM loses any silence at its end.
+
 ## Keys
 
 | Input | Action |
@@ -75,11 +93,18 @@ ringing finishes as it was.
 | `'` | Place mode on or off |
 | `Left` and `Right` | Move the Place cursor |
 | `\` | Bookmark the last slice played |
+| Cmd+C, Cmd+X, Cmd+V | Copy, cut or paste timeline hits. Pasting goes at the cursor. |
+| Cmd+D | Repeat the selected hits straight after themselves |
+| Cmd+A | Select every hit |
+| Delete | Delete the selected hits |
 | `Space` | Play or stop the timeline |
 | `Return` | Start or stop recording |
 | Cmd+Z | Undo. One undo removes a whole recorded take. |
 | `[` and `]` | Previous or next bank, when a song has more than 40 slices |
-| `Esc` | Stop everything, discarding a pause |
+| `Esc` | Stop everything, discarding a pause, and deselect |
+
+A key lights up while its sound is playing, with a line showing how far through it is. It turns
+orange while paused.
 
 **Choke** makes a new hit cut off other hits from the same file, so sounds from different
 songs layer. **Gate** stops a sound when you release its key, and recording keeps that length.
@@ -97,12 +122,18 @@ songs layer. **Gate** stops a sound when you release its key, and recording keep
 | Kit key | Right-click | Clear the key |
 | Sounds tab | Right-click a sound | Add to kit, rename, or move to the Trash |
 | Kits tab | Right-click a kit | Rename, duplicate or delete it |
-| Timeline | Drag a hit | Move it, snapped to the grid |
+| Timeline | Click a hit | Select it and hear it. Shift-click adds to the selection. |
+| Timeline | Drag a hit | Move the selected hits, snapped to the grid |
+| Timeline | Option-drag a hit | Copy the selected hits |
 | Timeline | Drag a hit's right edge | Change how long it plays |
-| Timeline | Click empty space | Move the Place cursor there |
+| Timeline | Click empty space | Move the cursor there and deselect |
+| Timeline | Drag across empty space | Select the hits inside |
+| Timeline | Click a lane's name | Select all of that sound's hits |
 | Timeline | Double-click a lane | Add a hit of that sound |
-| Timeline | Right-click a hit | Delete it |
+| Timeline | Right-click | Copy, cut, duplicate, delete or paste |
 | Timeline ruler | Click | Choose where playback starts |
+| Timeline ruler | Right-click | Play from the beginning again |
+| Sounds tab | Edit | Put a saved loop's hits back on the timeline |
 
 Moving the sensitivity slider or switching slice mode recalculates the slices and
 discards manual marker edits. Hits already recorded aren't affected.
@@ -111,7 +142,8 @@ discards manual marker edits. Hits already recorded aren't affected.
 
 Everything is under `~/Music/Amenity`:
 
-- `Sounds/`: your bookmarks and saved loops, as ordinary WAV files.
+- `Sounds/`: your bookmarks and saved loops, as ordinary WAV files. A saved loop also has an
+  `.amenity-loop` file beside it holding its hits, which renaming or trashing it takes along.
 - `session.amenity`: your kits, timeline and sound settings, saved automatically.
 - `session.v1.backup.amenity`: a copy of your session from before multiple kits.
 

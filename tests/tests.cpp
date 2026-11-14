@@ -5,6 +5,7 @@
 #include <fstream>
 #include <memory>
 #include <random>
+#include <set>
 #include <vector>
 
 #include "engine.h"
@@ -721,9 +722,7 @@ void testNeutralSettingsRenderNothingNew() {
     settings.pitch = 1.0f;
     CHECK(!settings.isNeutral());
     settings = SoundSettings{};
-    settings.loop = true;  // looping with an unknown tempo plays the whole file as it is
-    CHECK(settings.isNeutral());
-    settings.sourceBpm = 120.0f;  // with a known tempo, it's trimmed to a whole number of bars
+    settings.loop = true;  // a loop is always trimmed, to its bars or of trailing silence
     CHECK(!settings.isNeutral());
     settings = SoundSettings{};
     settings.punch = 0.5f;
@@ -824,6 +823,65 @@ void testLoopSnapsToWholeBars() {
     const auto fitted = renderSound(*source, 0, 360000, settings, 170.0);
     const size_t expected = static_cast<size_t>(std::llround(16.0 * 60.0 / 170.0 * kRate));
     CHECK(std::labs(static_cast<long>(fitted->frames) - static_cast<long>(expected)) <= 1);
+}
+
+// A sound that never goes quiet, so any silence in a render was added by it.
+std::shared_ptr<Sample> steadySample(size_t frames) { return sineSample(frames, 220.0f); }
+
+size_t trailingSilence(const Sample& sample) {
+    size_t silent = 0;
+    while (silent < sample.frames && std::fabs(sample.mono[sample.frames - 1 - silent]) < 1e-3f &&
+           std::fabs(sample.mono[sample.frames - 1 - std::min(silent + 30, sample.frames - 1)]) < 1e-3f) {
+        ++silent;
+    }
+    return silent;
+}
+
+void testLoopNeverPadsWithSilence() {
+    std::printf("a loop a little short of whole bars keeps all of itself, with no gap added\n");
+    // 15.5 beats at 136 BPM: the detected tempo is a touch slow for a 4-bar break.
+    const auto frames = static_cast<size_t>(15.5 * 60.0 / 136.0 * kRate);
+    const auto source = steadySample(frames);
+    SoundSettings settings;
+    settings.loop = true;
+    settings.sourceBpm = 136.0f;
+    const auto looped = renderSound(*source, 0, frames, settings, 136.0);
+    CHECK(looped->frames == frames);
+    CHECK(trailingSilence(*looped) < 48);
+
+    // Fitted, it's treated as exactly 4 bars, so it lands exactly on 4 bars at the new tempo.
+    settings.fit = true;
+    const auto fitted = renderSound(*source, 0, frames, settings, 170.0);
+    const auto fourBars = static_cast<long>(std::llround(16.0 * 60.0 / 170.0 * kRate));
+    CHECK(std::labs(static_cast<long>(fitted->frames) - fourBars) <= 1);
+    CHECK(trailingSilence(*fitted) < 48);
+}
+
+void testOddLengthLoopTrimsToSixteenths() {
+    std::printf("an odd-length loop is trimmed to whole 16th notes, not padded to the next length\n");
+    // 1.6 beats used to be padded to 2, leaving 0.4 beats of silence every time round.
+    const auto frames = static_cast<size_t>(1.6 * 60.0 / 120.0 * kRate);
+    const auto source = steadySample(frames);
+    SoundSettings settings;
+    settings.loop = true;
+    settings.sourceBpm = 120.0f;
+    const auto looped = renderSound(*source, 0, frames, settings, 120.0);
+    CHECK(looped->frames == static_cast<size_t>(std::llround(1.5 * 60.0 / 120.0 * kRate)));
+    CHECK(trailingSilence(*looped) < 48);
+
+    const LoopPlan plan = planLoop(frames, 120.0, kRate);
+    CHECK(plan.sourceBpm == 120.0);
+}
+
+void testLoopWithoutTempoDropsTrailingSilence() {
+    std::printf("with no tempo to go by, a loop loses its trailing silence\n");
+    auto source = steadySample(48000);
+    source->stereo.resize(72000 * 2, 0.0f);  // half a second of silence after it
+    finalizeSample(*source);
+    SoundSettings settings;
+    settings.loop = true;
+    const auto looped = renderSound(*source, 0, 72000, settings, 120.0);
+    CHECK(looped->frames <= 48000 && looped->frames > 47900);
 }
 
 void testCompressorReducesPeaksOnly() {
@@ -986,6 +1044,76 @@ void testQuantizeAll() {
     CHECK(timeline.events[1].beat == 1.0);
 }
 
+Timeline patternTimeline() {
+    Timeline timeline;
+    timeline.bars = 4;
+    TimelineEvent event;
+    event.end = 10;
+    for (double beat : {0.0, 1.0, 2.5, 3.0}) {
+        event.beat = beat;
+        event.path = beat == 1.0 || beat == 3.0 ? "snare.wav" : "kick.wav";
+        addHit(timeline, event);
+    }
+    return timeline;
+}
+
+void testCopyAndPaste() {
+    std::printf("copied hits paste at a beat, keeping their spacing\n");
+    Timeline timeline = patternTimeline();
+    std::set<uint64_t> ids;
+    for (const TimelineEvent& event : timeline.events) {
+        if (event.beat >= 1.0) ids.insert(event.id);
+    }
+    const auto clip = copyEvents(timeline, ids);
+    CHECK(clip.size() == 3);
+    CHECK(clip[0].beat == 0.0 && clip[1].beat == 1.5 && clip[2].beat == 2.0);  // measured from the first
+
+    const auto added = pasteEvents(timeline, clip, 8.0);
+    CHECK(added.size() == 3);
+    CHECK(timeline.events.size() == 7);
+    CHECK(timeline.events[4].beat == 8.0 && timeline.events[6].beat == 10.0);
+
+    // Pasting on top of the same hits adds nothing, and nothing goes past the end.
+    CHECK(pasteEvents(timeline, clip, 8.0).empty());
+    CHECK(pasteEvents(timeline, clip, 14.0).size() == 2);  // the third would be at 16, past the end of 4 bars
+    for (size_t i = 1; i < timeline.events.size(); ++i) CHECK(timeline.events[i - 1].beat <= timeline.events[i].beat);
+}
+
+void testPastedLoopStaysInsideTheTimeline() {
+    std::printf("a pasted loop that ran to the end of the timeline still ends there\n");
+    Timeline timeline;
+    timeline.bars = 2;
+    TimelineEvent event;
+    event.path = "loop.wav";
+    event.end = 10;
+    event.durationBeats = 8.0;
+    const uint64_t id = addHit(timeline, event);
+    const auto clip = copyEvents(timeline, {id});
+    pasteEvents(timeline, clip, 6.0);
+    CHECK(timeline.events.size() == 2);
+    CHECK(timeline.events[1].durationBeats == 2.0);
+}
+
+void testMusicalLength() {
+    std::printf("a copy follows on after a musical length\n");
+    CHECK(musicalLength(0.25) == 0.25);
+    CHECK(musicalLength(0.75) == 1.0);
+    CHECK(musicalLength(3.75) == 4.0);
+    CHECK(musicalLength(4.0) == 4.0);
+    CHECK(musicalLength(4.5) == 8.0);
+    CHECK(musicalLength(13.0) == 16.0);
+}
+
+void testRemoveDuplicates() {
+    std::printf("removing duplicates keeps one of each\n");
+    Timeline timeline = patternTimeline();
+    timeline.events.push_back(timeline.events[1]);
+    timeline.events.back().id = 99;
+    removeDuplicates(timeline);
+    CHECK(timeline.events.size() == 4);
+    CHECK(timeline.events[1].id != 99);
+}
+
 void testSessionRoundTrip() {
     std::printf("a session survives a save and load, including odd file names\n");
     const auto path = std::filesystem::temp_directory_path() / "amenity_test_session.txt";
@@ -995,6 +1123,7 @@ void testSessionRoundTrip() {
     session.quantizeIndex = 3;
     session.metronome = false;
     session.song = "/music/Do's & Don'ts - Song [1].mp3";
+    session.editingLoop = "/sounds/Loop 174 BPM.wav";
     session.kit().keys[7] = "/sounds/snare one.wav";
     session.kits.push_back(Kit{"Jungle kit", {}});
     session.kits[1].keys[2] = "/sounds/amen.wav";
@@ -1027,6 +1156,7 @@ void testSessionRoundTrip() {
     CHECK(same.quantizeIndex == 3);
     CHECK(!same.metronome);
     CHECK(same.song == session.song);
+    CHECK(same.editingLoop == session.editingLoop);
     CHECK(same.kits.size() == 2);
     CHECK(same.currentKit == 1);
     CHECK(same.kits[0].name == "Kit 1");
@@ -1156,6 +1286,9 @@ int main() {
     testFitRepitchChangesPitchWithTempo();
     testFitAndPitchCombine();
     testStretchHandlesShortSounds();
+    testLoopNeverPadsWithSilence();
+    testOddLengthLoopTrimsToSixteenths();
+    testLoopWithoutTempoDropsTrailingSilence();
     testLoopSnapsToWholeBars();
     testCompressorReducesPeaksOnly();
     testFilterSeparatesFrequencies();
@@ -1167,6 +1300,10 @@ int main() {
     testSnapping();
     testAddHitKeepsOrderAndDropsDuplicates();
     testQuantizeAll();
+    testCopyAndPaste();
+    testPastedLoopStaysInsideTheTimeline();
+    testMusicalLength();
+    testRemoveDuplicates();
     testSessionRoundTrip();
     testOlderSessionFormatLoads();
     testWavRoundTrip();

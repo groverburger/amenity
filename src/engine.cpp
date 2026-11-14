@@ -33,6 +33,7 @@ Engine::Engine(uint32_t sampleRate)
       releaseFrames_(std::max<size_t>(1, sampleRate / 200)) {   // 5 ms: when cut off early
     for (auto& position : positions_) position.store(-1, std::memory_order_relaxed);
     for (auto& sample : voiceSamples_) sample.store(nullptr, std::memory_order_relaxed);
+    for (auto& frozen : voiceFrozen_) frozen.store(false, std::memory_order_relaxed);
 }
 
 bool Engine::trigger(const Trigger& trigger) {
@@ -428,6 +429,7 @@ void Engine::render(float* out, uint32_t frames) {
         const Voice& voice = voices_[v];
         positions_[v].store(voice.active ? static_cast<int64_t>(voice.position) : -1, std::memory_order_relaxed);
         voiceSamples_[v].store(voice.active ? voice.sample : nullptr, std::memory_order_relaxed);
+        voiceFrozen_[v].store(voice.active && voice.frozen, std::memory_order_relaxed);
         sounding = sounding || (voice.active && !voice.frozen);
     }
     publishedBeat_.store(beat_, std::memory_order_relaxed);

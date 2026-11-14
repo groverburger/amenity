@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -63,6 +64,20 @@ uint64_t addHit(Timeline& timeline, TimelineEvent event);
 // Snaps all events inside the loop to a grid, removing any that end up duplicated.
 void quantizeAll(Timeline& timeline, double grid);
 
+// Removes hits that exactly repeat an earlier one: the same sound at the same beat.
+void removeDuplicates(Timeline& timeline);
+
+// Copies hits, with each beat measured from the earliest of them.
+std::vector<TimelineEvent> copyEvents(const Timeline& timeline, const std::set<uint64_t>& ids);
+
+// Adds copied hits from a beat onwards. Any that would land past the end of the loop, or
+// exactly on the same sound, are left out. Returns the ids of the hits added.
+std::vector<uint64_t> pasteEvents(Timeline& timeline, const std::vector<TimelineEvent>& clip, double atBeat);
+
+// How far along a copy should go so it follows on from a span of beats musically: a power
+// of two up to a bar, and whole bars beyond.
+double musicalLength(double beats);
+
 struct Kit {
     std::string name = "Kit 1";
     std::array<std::string, kKeysPerBank> keys;  // sound path per key; empty = unassigned
@@ -77,6 +92,7 @@ struct Session {
     int quantizeIndex = 4;  // 1/16
     bool metronome = true;
     std::string song;
+    std::string editingLoop;  // the saved loop whose arrangement is on the timeline, if any
     uint32_t sampleRate = 48000;  // the rate that frame positions are expressed in
 
     Kit& kit() { return kits[static_cast<size_t>(currentKit)]; }

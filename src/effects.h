@@ -86,6 +86,15 @@ struct SoundSettings {
     static SoundSettings parse(const std::string& text);
 };
 
+// How a looping sound is cut to a musical length at its own tempo. It's never padded with
+// silence, since that would leave a gap each time round. A sound a little short of a whole
+// length keeps all of itself, and its tempo is taken to be slightly faster instead.
+struct LoopPlan {
+    size_t frames = 0;
+    double sourceBpm = 0.0;  // the tempo to fit from
+};
+LoopPlan planLoop(size_t frames, double sourceBpm, uint32_t rate);
+
 // Renders a frame range of a sample through its settings. Runs on a worker thread.
 std::shared_ptr<const Sample> renderSound(const Sample& source, size_t start, size_t end,
                                           const SoundSettings& settings, double bpm);

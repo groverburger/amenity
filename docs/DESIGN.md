@@ -96,11 +96,22 @@ Fitting uses the sound's own BPM rather than a target length, so all slices of a
 scale by the same ratio and stay in time with each other. A loop is first trimmed to whole
 bars at that BPM, so the tail of a sampled break doesn't push it off the grid.
 
+A loop is never padded with silence, which would be heard as a gap each time round. A sound
+up to 6% short of a whole length is taken to be that length, with a slightly faster BPM
+(`planLoop`). Anything shorter is trimmed to whole 16th notes.
+
 ### Saved sounds and sessions
 
 A bookmark is an ordinary WAV file named by the user, so it keeps working if the
 source song moves and is usable in other software. The session file refers to
 sounds and songs by path, and stores frame positions along with their sample rate.
+
+A saved loop is a WAV too, so it plays like any other sound, with its arrangement in an
+`.amenity-loop` file beside it in the session format. Opening one replaces the timeline,
+as an undoable step that also restores the BPM and bars. Saving it again rewrites the WAV
+in place: the old copy stays alive until no voice is playing it, and its settings move to
+the new frame range so kits and shaping carry over. A loop can't be saved over while it's
+playing on its own timeline.
 
 ### Slicing
 
@@ -125,6 +136,10 @@ automatically, and a loop can be rendered back into a new sound.
 ### M1.6: shaping, placing and multiple kits (done)
 Per-sound pitch, tempo fit, looping and effects, with simple sliders over a detailed
 view. Pause and resume, placing hits without recording, and any number of kits.
+
+### M1.7: editing the timeline (done)
+Waveforms on hits, selection, moving and copying groups of hits, and saved loops that
+reopen for editing. Keys light up while their sound plays.
 
 Not yet: multiple or arranged clips, redo, master-bus effects, moving hits between
 lanes, and starting loops in time with the transport when played live.

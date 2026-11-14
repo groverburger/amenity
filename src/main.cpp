@@ -109,6 +109,16 @@ using LoadedBatch = std::vector<std::pair<std::string, std::shared_ptr<const Sam
 enum class SliceMode { Transients = 0, Grid = 1 };
 enum class KeyView { Slices = 0, Kit = 1 };
 
+// What one undo step brings back. Transport settings only change with an undo when the step
+// that saved them changed them too, like opening a saved loop.
+struct TimelineSnapshot {
+    std::vector<TimelineEvent> events;
+    std::string editingLoop;
+    bool hasTransport = false;
+    double bpm = 0.0;
+    int bars = 0;
+};
+
 // A playable range of a loaded file.
 struct SoundRef {
     std::string path;
@@ -180,6 +190,7 @@ struct App {
     bool textFocused = false;
 
     std::vector<fs::path> sounds;
+    std::set<fs::path> editableLoops;  // saved loops that have their arrangement with them
     bool selectSoundsTab = false;
 
     // Name dialog, for saving a new sound or renaming one.
@@ -187,6 +198,9 @@ struct App {
     bool nameFocus = false;
     bool nameOpen = false;
     std::shared_ptr<Sample> pendingSound;
+    bool pendingIsLoop = false;  // a bounce of the timeline, saved with its arrangement
+    fs::path replacing;          // the saved loop a bounce can update, if any
+    bool replaceLoop = true;
     fs::path renaming;
     std::array<char, 96> nameBuffer{};
     bool addToKit = true;
@@ -202,10 +216,17 @@ struct App {
     bool sequenceDirty = false;
     bool sessionDirty = false;
     double lastSave = 0.0;
-    std::vector<std::vector<TimelineEvent>> undo;
-    uint64_t dragEvent = 0;
+    std::vector<TimelineSnapshot> undo;
+    std::set<uint64_t> selection;
+    std::vector<TimelineEvent> clipboard;
+    uint64_t dragEvent = 0;  // the hit grabbed by the mouse
     double dragOffset = 0.0;
     bool dragResize = false;
+    std::map<uint64_t, double> dragOrigins;  // where each moving hit started
+    bool boxSelecting = false;
+    ImVec2 boxStart;
+    std::set<uint64_t> boxBase;  // what was selected before a Shift-drag added to it
+    std::set<std::string> queuedLoads;  // files to load once the current batch is done
 };
 
 App* gApp = nullptr;
@@ -323,23 +344,158 @@ void publishSequence(App& app) {
     app.sequenceDirty = !app.engine->setSequence(buildSequence(app));  // retried next frame if the queue was full
 }
 
-void pushUndo(App& app) {
-    app.undo.push_back(app.session.timeline.events);
+void pushUndo(App& app, bool withTransport = false) {
+    TimelineSnapshot snapshot;
+    snapshot.events = app.session.timeline.events;
+    snapshot.editingLoop = app.session.editingLoop;
+    snapshot.hasTransport = withTransport;
+    snapshot.bpm = app.session.timeline.bpm;
+    snapshot.bars = app.session.timeline.bars;
+    app.undo.push_back(std::move(snapshot));
     if (app.undo.size() > kMaxUndo) app.undo.erase(app.undo.begin());
 }
 
-void performUndo(App& app) {
-    if (app.undo.empty()) return;
-    app.session.timeline.events = std::move(app.undo.back());
-    app.undo.pop_back();
-    publishSequence(app);
-    markSessionDirty(app);
+bool sameEvents(const std::vector<TimelineEvent>& a, const std::vector<TimelineEvent>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].id != b[i].id || a[i].beat != b[i].beat || a[i].durationBeats != b[i].durationBeats) return false;
+    }
+    return true;
 }
 
 void applyTransportSettings(App& app) {
     app.engine->setTempo(app.session.timeline.bpm);
     app.engine->setLoopBeats(app.session.timeline.loopBeats());
     app.engine->setMetronome(app.session.metronome);
+}
+
+void performUndo(App& app) {
+    if (app.undo.empty()) return;
+    TimelineSnapshot& snapshot = app.undo.back();
+    app.session.timeline.events = std::move(snapshot.events);
+    app.session.editingLoop = std::move(snapshot.editingLoop);
+    if (snapshot.hasTransport) {
+        app.session.timeline.bpm = snapshot.bpm;
+        app.session.timeline.bars = snapshot.bars;
+        applyTransportSettings(app);
+    }
+    app.undo.pop_back();
+    app.selection.clear();
+    publishSequence(app);
+    markSessionDirty(app);
+}
+
+// ---- Editing the timeline --------------------------------------------------
+
+double gridBeats(const App& app) { return kQuantizeOptions[static_cast<size_t>(app.session.quantizeIndex)].beats; }
+
+// How long a hit is drawn and plays for, in beats.
+double hitLengthBeats(const App& app, const TimelineEvent& event) {
+    if (event.durationBeats > 0.0) return event.durationBeats;
+    const Playable playable = resolvePlayable(app, event.sound());
+    if (!playable.sample) return 0.0;
+    return static_cast<double>(playable.end - playable.start) * app.session.timeline.bpm / 60.0 / app.sampleRate;
+}
+
+// A hit's length without any reverb or echo tail: how long the sound itself lasts.
+double dryLengthBeats(const App& app, const TimelineEvent& event) {
+    if (event.durationBeats > 0.0) return event.durationBeats;
+    const SoundSettings& s = settingsFor(app, event.sound());
+    const double bpm = app.session.timeline.bpm;
+    double frames = static_cast<double>(event.end - event.start);
+    double sourceBpm = s.sourceBpm;
+    if (s.loop && sourceBpm > 0.0) {
+        const LoopPlan plan = planLoop(event.end - event.start, sourceBpm, app.sampleRate);
+        frames = static_cast<double>(plan.frames);
+        sourceBpm = plan.sourceBpm;
+    }
+    if (s.fit && sourceBpm > 0.0) {
+        frames *= sourceBpm / bpm;  // any pitch change on top keeps this length
+    } else if (std::fabs(s.pitch) > 1e-3f && !s.keepLength) {
+        frames /= std::pow(2.0, static_cast<double>(s.pitch) / 12.0);
+    }
+    return frames * bpm / 60.0 / app.sampleRate;
+}
+
+// How far after the start of some copied hits a copy should go, so it follows on in time.
+double clipShift(const App& app, const std::vector<TimelineEvent>& clip) {
+    if (clip.empty()) return 0.0;
+    const double grid = gridBeats(app);
+    const double step = grid > 0.0 ? grid : 0.25;
+    if (clip.size() == 1) {
+        // One hit goes straight after itself.
+        const double length = std::max(dryLengthBeats(app, clip.front()), step);
+        return std::ceil(length / step - 1e-9) * step;
+    }
+    return musicalLength(clip.back().beat + step);
+}
+
+void deleteSelection(App& app) {
+    if (app.selection.empty()) return;
+    pushUndo(app);
+    std::erase_if(app.session.timeline.events, [&](const TimelineEvent& e) { return app.selection.count(e.id) > 0; });
+    app.selection.clear();
+    publishSequence(app);
+    markSessionDirty(app);
+}
+
+void copySelection(App& app) {
+    if (app.selection.empty()) return;
+    app.clipboard = copyEvents(app.session.timeline, app.selection);
+    app.status = "Copied " + std::to_string(app.clipboard.size()) + " hit(s). Cmd+V pastes them at the cursor.";
+}
+
+void cutSelection(App& app) {
+    if (app.selection.empty()) return;
+    copySelection(app);
+    deleteSelection(app);
+}
+
+// Pastes at the cursor, then moves the cursor on, so pasting again lays the copies end to end.
+void pasteClipboard(App& app) {
+    if (app.clipboard.empty()) {
+        app.status = "Nothing copied yet. Select hits and press Cmd+C.";
+        return;
+    }
+    pushUndo(app);
+    const std::vector<uint64_t> added = pasteEvents(app.session.timeline, app.clipboard, app.editCursor);
+    if (added.empty()) {
+        app.undo.pop_back();
+        app.status = "Nothing to paste there: it's past the end, or those hits are already there";
+        return;
+    }
+    app.selection = std::set<uint64_t>(added.begin(), added.end());
+    const double loop = app.session.timeline.loopBeats();
+    app.editCursor = std::min(app.editCursor + clipShift(app, app.clipboard), loop);
+    if (app.editCursor > loop - 1e-6) app.editCursor = 0.0;
+    publishSequence(app);
+    markSessionDirty(app);
+}
+
+// Copies the selection to just after itself, like repeating a bar.
+void duplicateSelection(App& app) {
+    if (app.selection.empty()) return;
+    const std::vector<TimelineEvent> clip = copyEvents(app.session.timeline, app.selection);
+    double first = app.session.timeline.loopBeats();
+    for (const TimelineEvent& event : app.session.timeline.events) {
+        if (app.selection.count(event.id)) first = std::min(first, event.beat);
+    }
+    pushUndo(app);
+    const std::vector<uint64_t> added = pasteEvents(app.session.timeline, clip, first + clipShift(app, clip));
+    if (added.empty()) {
+        app.undo.pop_back();
+        app.status = "No room after the selection. Add bars to make space.";
+        return;
+    }
+    if (added.size() < clip.size()) app.status = "Some hits went past the end of the timeline and were left out";
+    app.selection = std::set<uint64_t>(added.begin(), added.end());
+    publishSequence(app);
+    markSessionDirty(app);
+}
+
+void selectAll(App& app) {
+    app.selection.clear();
+    for (const TimelineEvent& event : app.session.timeline.events) app.selection.insert(event.id);
 }
 
 void clearLatches(App& app) {
@@ -519,15 +675,30 @@ SoundRef fileSound(const App& app, const std::string& path) {
 
 // ---- Saved sounds ----------------------------------------------------------
 
+fs::path arrangementPath(const fs::path& sound);
+
 void refreshSounds(App& app) {
     app.sounds.clear();
+    app.editableLoops.clear();
     std::error_code error;
     for (fs::directory_iterator it(app.soundsDir, error), end; !error && it != end; it.increment(error)) {
-        if (lowercase(it->path().extension().string()) == ".wav") app.sounds.push_back(it->path());
+        if (lowercase(it->path().extension().string()) != ".wav") continue;
+        app.sounds.push_back(it->path());
+        std::error_code existsError;
+        if (fs::exists(arrangementPath(it->path()), existsError)) app.editableLoops.insert(it->path());
     }
     std::sort(app.sounds.begin(), app.sounds.end(), [](const fs::path& a, const fs::path& b) {
         return lowercase(a.stem().string()) < lowercase(b.stem().string());
     });
+}
+
+// A saved loop keeps its arrangement next to it, so it can go back on the timeline to edit.
+constexpr const char* kArrangementExtension = ".amenity-loop";
+
+fs::path arrangementPath(const fs::path& sound) {
+    fs::path path = sound;
+    path.replace_extension(kArrangementExtension);
+    return path;
 }
 
 // Makes a user-entered name safe as a file name.
@@ -559,8 +730,9 @@ int firstEmptyKitKey(const App& app) {
     return -1;
 }
 
-bool saveNewSound(App& app, const std::shared_ptr<Sample>& sound, const std::string& name, bool addToKit,
-                  const SoundSettings& settings = {}) {
+// Returns where it was saved, or an empty path if it couldn't be.
+fs::path saveNewSound(App& app, const std::shared_ptr<Sample>& sound, const std::string& name, bool addToKit,
+                      const SoundSettings& settings = {}) {
     std::error_code error;
     fs::create_directories(app.soundsDir, error);
     const fs::path path = uniqueSoundPath(app, cleanName(name));
@@ -568,7 +740,7 @@ bool saveNewSound(App& app, const std::shared_ptr<Sample>& sound, const std::str
     sound->name = path.filename().string();
     if (!writeWav(*sound, path.string())) {
         app.status = "Couldn't save " + path.string();
-        return false;
+        return {};
     }
     app.store[path.string()] = sound;
     const SoundKey key{path.string(), 0, sound->frames};
@@ -589,6 +761,128 @@ bool saveNewSound(App& app, const std::shared_ptr<Sample>& sound, const std::str
             app.status += " (the kit is full)";
         }
     }
+    return path;
+}
+
+// Writes what's on the timeline next to a saved loop, so it can be opened and edited later.
+bool writeArrangement(const App& app, const fs::path& sound) {
+    Session arrangement;
+    arrangement.timeline = app.session.timeline;
+    arrangement.quantizeIndex = app.session.quantizeIndex;
+    arrangement.metronome = app.session.metronome;
+    arrangement.sampleRate = app.sampleRate;
+    for (const TimelineEvent& event : app.session.timeline.events) {
+        const auto found = app.session.soundSettings.find(event.sound());
+        if (found != app.session.soundSettings.end()) arrangement.soundSettings[found->first] = found->second;
+    }
+    return saveSession(arrangement, arrangementPath(sound).string());
+}
+
+// Loads files in the background. Anything asked for while a batch is running waits for the next.
+void loadPaths(App& app, std::set<std::string> paths) {
+    for (auto it = paths.begin(); it != paths.end();) {
+        it = findLoaded(app, *it) ? paths.erase(it) : std::next(it);
+    }
+    if (paths.empty()) return;
+    if (app.batch.valid()) {
+        app.queuedLoads.insert(paths.begin(), paths.end());
+        return;
+    }
+    app.batch = std::async(std::launch::async, [paths, rate = app.sampleRate] {
+        LoadedBatch loaded;
+        for (const std::string& path : paths) {
+            std::string error;
+            std::shared_ptr<const Sample> sample = loadSample(path, rate, error);
+            if (sample) loaded.emplace_back(path, std::move(sample));
+        }
+        return loaded;
+    });
+}
+
+// Puts a saved loop's arrangement back on the timeline. One undo brings back what was there.
+void openLoopForEditing(App& app, const fs::path& sound) {
+    Session arrangement;
+    if (!loadSession(arrangement, arrangementPath(sound).string(), app.sampleRate)) {
+        app.status = "There's no arrangement saved with " + sound.stem().string();
+        return;
+    }
+    pushUndo(app, true);
+    Timeline& timeline = app.session.timeline;
+    timeline.bpm = arrangement.timeline.bpm;
+    timeline.bars = arrangement.timeline.bars;
+    timeline.events = std::move(arrangement.timeline.events);
+    for (TimelineEvent& event : timeline.events) event.id = timeline.nextId++;
+    // Sounds keep any shaping they've had since, which their other uses share.
+    for (const auto& [key, settings] : arrangement.soundSettings) app.session.soundSettings.emplace(key, settings);
+    app.session.editingLoop = sound.string();
+    app.selection.clear();
+    app.playStart = 0.0;
+    app.editCursor = 0.0;
+
+    std::set<std::string> needed;
+    for (const TimelineEvent& event : timeline.events) needed.insert(event.path);
+    loadPaths(app, needed);
+    applyTransportSettings(app);
+    publishSequence(app);
+    markSessionDirty(app);
+    app.status = "Editing " + sound.stem().string() + ". Save loop updates it everywhere it's used; Cmd+Z puts back what was here.";
+}
+
+// Moves settings, processed copies and hits from one frame range of a file to another.
+void remapSoundRange(App& app, const std::string& path, size_t oldEnd, size_t newEnd) {
+    const SoundKey from{path, 0, oldEnd};
+    const SoundKey to{path, 0, newEnd};
+    const auto settings = app.session.soundSettings.find(from);
+    if (settings != app.session.soundSettings.end() && !(from == to)) {
+        SoundSettings moved = settings->second;
+        app.session.soundSettings.erase(settings);
+        app.session.soundSettings[to] = moved;
+    }
+    const auto remap = [&](std::vector<TimelineEvent>& events) {
+        for (TimelineEvent& event : events) {
+            if (event.path == path && event.start == 0 && event.end == oldEnd) event.end = newEnd;
+        }
+    };
+    remap(app.session.timeline.events);
+    for (auto& snapshot : app.undo) remap(snapshot.events);
+    if (app.selected == from) app.selected = to;
+}
+
+// Saves over a loop that was saved before. Kits and anything else using it get the new version.
+bool replaceSound(App& app, const fs::path& path, const std::shared_ptr<Sample>& sound) {
+    const std::string pathText = path.string();
+    sound->path = pathText;
+    sound->name = path.filename().string();
+    const std::string temporary = pathText + ".saving";
+    std::error_code error;
+    if (!writeWav(*sound, temporary) || (fs::rename(temporary, path, error), error)) {
+        fs::remove(temporary, error);
+        app.status = "Couldn't save " + pathText;
+        return false;
+    }
+
+    size_t oldFrames = sound->frames;
+    const auto loaded = app.store.find(pathText);
+    if (loaded != app.store.end()) {
+        oldFrames = loaded->second->frames;
+        app.fadingRenders.push_back(loaded->second);  // freed once nothing is playing it
+    }
+    app.store[pathText] = sound;
+    // Processed copies were made from the old version.
+    for (auto it = app.renders.begin(); it != app.renders.end();) {
+        if (it->first.path == pathText) {
+            app.fadingRenders.push_back(std::move(it->second.sample));
+            it = app.renders.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    remapSoundRange(app, pathText, oldFrames, sound->frames);
+    app.selected = SoundKey{pathText, 0, sound->frames};
+    app.hasSelected = true;
+    publishSequence(app);
+    markSessionDirty(app);
+    app.status = "Updated " + path.filename().string();
     return true;
 }
 
@@ -612,6 +906,7 @@ void requestBookmark(App& app) {
     }
     const auto slice = static_cast<size_t>(app.lastSlice);
     app.pendingSound = clipForSlice(app, slice);
+    app.pendingIsLoop = false;
     // The bookmark starts out sounding just like the slice did.
     app.pendingSettings = settingsFor(app, {app.sample->path, app.markers[slice], sliceEnd(app, slice)});
     if (app.pendingSettings.sourceBpm <= 0.0f) app.pendingSettings.sourceBpm = static_cast<float>(app.songBpm);
@@ -623,6 +918,7 @@ void requestBookmark(App& app) {
 void requestBookmarkSong(App& app) {
     if (!app.sample || app.markers.empty()) return;
     app.pendingSound = extractClip(*app.sample, app.markers.front(), app.sample->frames);
+    app.pendingIsLoop = false;
     app.pendingSettings = SoundSettings{};
     app.pendingSettings.sourceBpm = static_cast<float>(app.songBpm);
     app.renaming.clear();
@@ -634,19 +930,48 @@ std::shared_ptr<Sample> bounceLoop(const App& app) {
                           app.sampleRate);
 }
 
+bool timelineUses(const App& app, const std::string& path) {
+    return std::any_of(app.session.timeline.events.begin(), app.session.timeline.events.end(),
+                       [&](const TimelineEvent& e) { return e.path == path; });
+}
+
 void requestSaveLoop(App& app) {
     app.pendingSound = bounceLoop(app);
+    app.pendingIsLoop = true;
     app.pendingSettings = SoundSettings{};
     app.pendingSettings.sourceBpm = static_cast<float>(app.session.timeline.bpm);
     app.renaming.clear();
+    app.kitDialog = kNoKitDialog;
+    // A loop that was opened for editing can be updated in place, unless it's playing in itself.
+    const fs::path editing = app.session.editingLoop;
+    app.replacing.clear();
+    if (!editing.empty() && fs::exists(editing) && !timelineUses(app, editing.string())) {
+        app.replacing = editing;
+        app.replaceLoop = true;
+        openNameDialog(app, editing.stem().string());
+        return;
+    }
     char name[64];
     std::snprintf(name, sizeof(name), "Loop %d BPM", static_cast<int>(std::lround(app.session.timeline.bpm)));
     openNameDialog(app, name);
 }
 
-bool timelineUses(const App& app, const std::string& path) {
-    return std::any_of(app.session.timeline.events.begin(), app.session.timeline.events.end(),
-                       [&](const TimelineEvent& e) { return e.path == path; });
+// Saves the bounce from the name dialog, along with the arrangement that made it.
+void savePendingLoop(App& app) {
+    fs::path saved;
+    if (!app.replacing.empty() && app.replaceLoop) {
+        if (replaceSound(app, app.replacing, app.pendingSound)) saved = app.replacing;
+    } else {
+        saved = saveNewSound(app, app.pendingSound, app.nameBuffer.data(), app.addToKit, app.pendingSettings);
+    }
+    if (saved.empty()) return;
+    if (!writeArrangement(app, saved)) {
+        app.status = "Saved the sound, but couldn't save its arrangement for editing later";
+        return;
+    }
+    app.session.editingLoop = saved.string();
+    refreshSounds(app);
+    markSessionDirty(app);
 }
 
 void renameSound(App& app, const fs::path& from, const std::string& name) {
@@ -691,10 +1016,14 @@ void renameSound(App& app, const fs::path& from, const std::string& name) {
         if (event.path == oldPath) event.path = newPath;
     }
     for (auto& snapshot : app.undo) {
-        for (TimelineEvent& event : snapshot) {
+        for (TimelineEvent& event : snapshot.events) {
             if (event.path == oldPath) event.path = newPath;
         }
+        if (snapshot.editingLoop == oldPath) snapshot.editingLoop = newPath;
     }
+    if (app.session.editingLoop == oldPath) app.session.editingLoop = newPath;
+    // A saved loop's arrangement goes with it.
+    if (fs::exists(arrangementPath(from))) fs::rename(arrangementPath(from), arrangementPath(to), error);
     refreshSounds(app);
     markSessionDirty(app);
 }
@@ -712,6 +1041,13 @@ void trashSound(App& app, const fs::path& path) {
         app.status = "Couldn't move " + path.filename().string() + " to the Trash";
         return;
     }
+    const fs::path arrangement = arrangementPath(path);
+    if (fs::exists(arrangement)) {
+        fs::path arrangementTarget = target;
+        arrangementTarget.replace_extension(kArrangementExtension);
+        fs::rename(arrangement, arrangementTarget, error);
+    }
+    if (app.session.editingLoop == path.string()) app.session.editingLoop.clear();
     for (Kit& kit : app.session.kits) {
         for (std::string& key : kit.keys) {
             if (key == path.string()) key.clear();
@@ -732,7 +1068,7 @@ void sweepStore(App& app) {
     for (const Kit& kit : app.session.kits) used.insert(kit.keys.begin(), kit.keys.end());
     for (const TimelineEvent& event : app.session.timeline.events) used.insert(event.path);
     for (const auto& snapshot : app.undo) {
-        for (const TimelineEvent& event : snapshot) used.insert(event.path);
+        for (const TimelineEvent& event : snapshot.events) used.insert(event.path);
     }
     for (const fs::path& sound : app.sounds) used.insert(sound.string());
 
@@ -829,16 +1165,8 @@ void startStartupLoad(App& app) {
         }
     }
     for (const TimelineEvent& event : app.session.timeline.events) paths.insert(event.path);
-
-    app.batch = std::async(std::launch::async, [paths, rate = app.sampleRate] {
-        LoadedBatch loaded;
-        for (const std::string& path : paths) {
-            std::string error;
-            std::shared_ptr<const Sample> sample = loadSample(path, rate, error);
-            if (sample) loaded.emplace_back(path, std::move(sample));
-        }
-        return loaded;
-    });
+    loadPaths(app, std::move(paths));
+    if (!app.batch.valid()) app.startupLoaded = true;
 }
 
 void finishStartupLoadIfReady(App& app) {
@@ -846,6 +1174,11 @@ void finishStartupLoadIfReady(App& app) {
     for (auto& [path, sample] : app.batch.get()) app.store.emplace(path, std::move(sample));
     app.startupLoaded = true;
     publishSequence(app);
+    if (!app.queuedLoads.empty()) {
+        std::set<std::string> next;
+        next.swap(app.queuedLoads);
+        loadPaths(app, std::move(next));
+    }
 
     std::set<std::string> missing;
     for (const Kit& kit : app.session.kits) {
@@ -1022,7 +1355,15 @@ void onKey(App& app, int key, int action, int mods) {
     }
     if (app.textFocused || (mods & GLFW_MOD_CONTROL)) return;
     if (mods & GLFW_MOD_SUPER) {
-        if (key == GLFW_KEY_Z) performUndo(app);
+        switch (key) {
+            case GLFW_KEY_Z: performUndo(app); break;
+            case GLFW_KEY_C: copySelection(app); break;
+            case GLFW_KEY_X: cutSelection(app); break;
+            case GLFW_KEY_V: pasteClipboard(app); break;
+            case GLFW_KEY_D: duplicateSelection(app); break;
+            case GLFW_KEY_A: selectAll(app); break;
+            default: break;
+        }
         return;
     }
 
@@ -1067,9 +1408,14 @@ void onKey(App& app, int key, int action, int mods) {
         case GLFW_KEY_EQUAL:
             switchKit(app, app.session.currentKit + 1);
             break;
+        case GLFW_KEY_BACKSPACE:
+        case GLFW_KEY_DELETE:
+            deleteSelection(app);
+            break;
         case GLFW_KEY_ESCAPE:
             stopTransport(app);
             app.engine->stopAll();
+            app.selection.clear();
             break;
         default:
             break;
@@ -1268,6 +1614,39 @@ void drawWaveform(App& app, ImVec2 size) {
 
 // ---- Keyboard view -----------------------------------------------------------
 
+// Whether a key's sound is playing right now, and how far through it.
+struct KeyActivity {
+    float progress = -1.0f;  // 0..1, or -1 when it's not playing
+    bool paused = false;
+};
+
+KeyActivity keyActivity(const App& app, const SoundRef& sound) {
+    KeyActivity activity;
+    if (!sound.sample || sound.end <= sound.start) return activity;
+    const Playable playable = resolvePlayable(app, {sound.path, sound.start, sound.end});
+    for (int v = 0; v < Engine::kMaxVoices; ++v) {
+        const int64_t position = app.engine->voicePosition(v);
+        if (position < 0) continue;
+        const Sample* sample = app.engine->voiceSample(v);
+        const auto at = static_cast<size_t>(position);
+        float progress = -1.0f;
+        // Its processed copy, or the source itself, as when the whole song plays through it.
+        if (sample == playable.sample && at >= playable.start && at < playable.end) {
+            progress = static_cast<float>(at - playable.start) / static_cast<float>(playable.end - playable.start);
+        } else if (sample == sound.sample && at >= sound.start && at < sound.end) {
+            progress = static_cast<float>(at - sound.start) / static_cast<float>(sound.end - sound.start);
+        }
+        if (progress < 0.0f) continue;
+        const bool frozen = app.engine->voiceFrozen(v);
+        // A voice that's playing wins over one that's paused.
+        if (activity.progress < 0.0f || (activity.paused && !frozen)) {
+            activity.progress = progress;
+            activity.paused = frozen;
+        }
+    }
+    return activity;
+}
+
 void drawKeyboard(App& app, ImVec2 size) {
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     constexpr float kGap = 5.0f;
@@ -1334,14 +1713,24 @@ void drawKeyboard(App& app, ImVec2 size) {
                         innerWidth, thumbTop + thumbHeight * 0.5f, thumbHeight * 0.5f, colors::kWaveQuiet);
         }
 
+        // While its sound plays, a key stays lit and shows how far through it is.
+        const KeyActivity activity = keyActivity(app, sound);
+        const bool sounding = activity.progress >= 0.0f;
+        const ImU32 activeColor = activity.paused ? IM_COL32(236, 174, 66, 255) : colors::kMarkerHot;
+        if (sounding) {
+            draw->AddRectFilled(a, b, activity.paused ? IM_COL32(236, 174, 66, 34) : IM_COL32(120, 220, 255, 40), 4.0f);
+            const float x = a.x + 4.0f + (keyWidth - 8.0f) * activity.progress;
+            draw->AddLine(ImVec2(x, a.y + 20.0f), ImVec2(x, b.y - 4.0f), activeColor, 1.5f);
+            draw->AddRectFilled(ImVec2(a.x + 2.0f, b.y - 4.0f), ImVec2(x, b.y - 2.0f), activeColor, 1.0f);
+        }
         const double sinceHit = now - app.lastHit[k];
         if (playable && app.lastHit[k] > 0.0 && sinceHit < 0.25) {
             const int alpha = static_cast<int>(170.0 * (1.0 - sinceHit / 0.25));
             draw->AddRectFilled(a, b, IM_COL32(120, 220, 255, alpha), 4.0f);
         }
         // A latched loop keeps a bright border until it's stopped.
-        const bool lit = app.held[k] || !app.latched[k].path.empty();
-        draw->AddRect(a, b, lit ? colors::kMarkerHot : colors::kCellBorder, 4.0f, 0, lit ? 2.0f : 1.0f);
+        const bool lit = app.held[k] || !app.latched[k].path.empty() || sounding;
+        draw->AddRect(a, b, lit ? activeColor : colors::kCellBorder, 4.0f, 0, lit ? 2.0f : 1.0f);
         draw->AddText(ImVec2(a.x + 6.0f, a.y + 3.0f), playable ? IM_COL32_WHITE : colors::kDim, kKeys[k].label);
 
         if (kitView && assigned) {
@@ -1392,11 +1781,16 @@ void drawSounds(App& app) {
     ImGui::TextDisabled("Click to hear, drag onto a kit key");
     ImGui::BeginChild("sounds");
     fs::path toTrash;
+    fs::path toEdit;
     for (const fs::path& path : app.sounds) {
         const std::string pathText = path.string();
         const std::string stem = path.stem().string();
+        const bool editable = app.editableLoops.count(path) > 0;
         ImGui::PushID(pathText.c_str());
-        if (ImGui::Selectable(stem.c_str())) {
+        const float editWidth = editable ? ImGui::CalcTextSize("Edit").x + 12.0f : 0.0f;
+        const bool editing = pathText == app.session.editingLoop;
+        if (ImGui::Selectable(stem.c_str(), editing, ImGuiSelectableFlags_AllowOverlap,
+                              ImVec2(ImGui::GetContentRegionAvail().x - editWidth, 0.0f))) {
             playSound(app, fileSound(app, pathText), kAuditionVoiceKey, 1.0f, false, false);
         }
         if (ImGui::BeginDragDropSource()) {
@@ -1422,15 +1816,24 @@ void drawSounds(App& app) {
                 app.renaming = path;
                 openNameDialog(app, stem);
             }
+            if (editable && ImGui::MenuItem("Edit on the timeline")) toEdit = path;
             const bool inUse = timelineUses(app, pathText);
             if (ImGui::MenuItem("Move to Trash", nullptr, false, !inUse)) toTrash = path;
             if (inUse) ImGui::SetItemTooltip("Used on the timeline");
             ImGui::EndPopup();
         }
+        if (editable) {
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - editWidth + 4.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 0.0f));
+            if (ImGui::SmallButton("Edit")) toEdit = path;
+            ImGui::PopStyleVar();
+            ImGui::SetItemTooltip("Put this loop's hits back on the timeline to change them. Cmd+Z puts back what was there.");
+        }
         ImGui::PopID();
     }
     ImGui::EndChild();
     if (!toTrash.empty()) trashSound(app, toTrash);
+    if (!toEdit.empty()) openLoopForEditing(app, toEdit);
 }
 
 void drawKits(App& app) {
@@ -1831,12 +2234,21 @@ void drawNameDialog(App& app) {
         ImGui::SetKeyboardFocusHere();
         app.nameFocus = false;
     }
+    const bool replacing = app.pendingIsLoop && !app.replacing.empty();
+    if (replacing) {
+        ImGui::Checkbox("Update the loop you're editing", &app.replaceLoop);
+        ImGui::SetItemTooltip("Kits and anything else using it get the new version. Untick to save a new sound.");
+    }
+    const bool updating = replacing && app.replaceLoop;
+    ImGui::BeginDisabled(updating);
     ImGui::SetNextItemWidth(320.0f);
-    const bool entered = ImGui::InputText("##name", app.nameBuffer.data(), app.nameBuffer.size(),
-                                          ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    bool entered = ImGui::InputText("##name", app.nameBuffer.data(), app.nameBuffer.size(),
+                                    ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
     if (!isRename && !isKit) ImGui::Checkbox("Add to kit", &app.addToKit);
+    ImGui::EndDisabled();
+    if (updating && ImGui::IsKeyPressed(ImGuiKey_Enter)) entered = true;
 
-    const bool save = ImGui::Button(isKit ? "OK" : (isRename ? "Rename" : "Save")) || entered;
+    const bool save = ImGui::Button(isKit ? "OK" : (isRename ? "Rename" : (updating ? "Update" : "Save"))) || entered;
     ImGui::SameLine();
     const bool cancel = ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape);
     if (save) {
@@ -1849,12 +2261,16 @@ void drawNameDialog(App& app) {
             markSessionDirty(app);
         } else if (isRename) {
             renameSound(app, app.renaming, app.nameBuffer.data());
+        } else if (app.pendingSound && app.pendingIsLoop) {
+            savePendingLoop(app);
         } else if (app.pendingSound) {
             saveNewSound(app, app.pendingSound, app.nameBuffer.data(), app.addToKit, app.pendingSettings);
         }
     }
     if (save || cancel) {
         app.pendingSound.reset();
+        app.pendingIsLoop = false;
+        app.replacing.clear();
         app.kitDialog = kNoKitDialog;
         app.renaming.clear();
         app.nameOpen = false;
@@ -1955,6 +2371,8 @@ void drawTransport(App& app) {
     if (ImGui::Button("Clear")) {
         pushUndo(app);
         timeline.events.clear();
+        app.selection.clear();
+        app.session.editingLoop.clear();  // what's built next is a new loop
         publishSequence(app);
         markSessionDirty(app);
     }
@@ -1992,14 +2410,113 @@ std::string laneLabel(const App& app, const TimelineEvent& event) {
     return label;
 }
 
+// The lowest and highest values in a range of frames, from the peak table when it's long.
+void peakRange(const Sample& sample, size_t from, size_t to, float& low, float& high) {
+    to = std::min(to, sample.frames);
+    if (from >= to) return;
+    if (to - from >= Sample::kPeakBlock * 2) {
+        const size_t last = std::min(to / Sample::kPeakBlock + 1, sample.peakMin.size());
+        for (size_t i = from / Sample::kPeakBlock; i < last; ++i) {
+            low = std::min(low, sample.peakMin[i]);
+            high = std::max(high, sample.peakMax[i]);
+        }
+    } else {
+        for (size_t i = from; i < to; ++i) {
+            low = std::min(low, sample.mono[i]);
+            high = std::max(high, sample.mono[i]);
+        }
+    }
+}
+
+// Draws a hit's waveform the way it plays: reversed, or repeating if it loops. Anything past
+// the hit's length is cut off by the caller's clip rectangle.
+void drawHitWave(ImDrawList* draw, const Sample& sample, size_t start, size_t end, bool reverse, bool loop,
+                 double framesPerPixel, float x0, float x1, float midY, float halfHeight, ImU32 color) {
+    const double length = static_cast<double>(end - start);
+    if (end <= start || framesPerPixel <= 0.0) return;
+    for (float x = x0; x < x1; x += 1.0f) {
+        double a = static_cast<double>(x - x0) * framesPerPixel;
+        double b = a + framesPerPixel;
+        if (!loop && a >= length) break;
+        if (loop) {
+            const double wrapped = std::floor(a / length) * length;
+            a -= wrapped;
+            b -= wrapped;
+        }
+        b = std::min(b, length);
+        size_t from = 0;
+        size_t to = 0;
+        if (reverse) {
+            from = end - static_cast<size_t>(std::ceil(b));
+            to = end - static_cast<size_t>(a);
+        } else {
+            from = start + static_cast<size_t>(a);
+            to = start + static_cast<size_t>(std::ceil(b));
+        }
+        float low = 1.0f;
+        float high = -1.0f;
+        peakRange(sample, from, std::max(to, from + 1), low, high);
+        if (high < low) continue;
+        draw->AddLine(ImVec2(x + 0.5f, midY - high * halfHeight), ImVec2(x + 0.5f, midY - low * halfHeight + 1.0f),
+                      color);
+    }
+}
+
+struct HitBox {
+    uint64_t id = 0;
+    ImVec2 min;
+    ImVec2 max;
+};
+
+void finishDrag(App& app) {
+    Timeline& timeline = app.session.timeline;
+    app.dragEvent = 0;
+    app.dragResize = false;
+    app.dragOrigins.clear();
+    std::stable_sort(timeline.events.begin(), timeline.events.end(),
+                     [](const TimelineEvent& a, const TimelineEvent& b) { return a.beat < b.beat; });
+    // An Option-drag that went nowhere leaves its copies on top of the originals.
+    removeDuplicates(timeline);
+    std::erase_if(app.selection, [&](uint64_t id) {
+        return std::none_of(timeline.events.begin(), timeline.events.end(), [id](const TimelineEvent& e) { return e.id == id; });
+    });
+    publishSequence(app);
+    // A click that didn't move anything isn't worth an undo step.
+    if (!app.undo.empty() && sameEvents(app.undo.back().events, timeline.events)) {
+        app.undo.pop_back();
+    } else {
+        markSessionDirty(app);
+    }
+}
+
+// Option-drag: the selected hits are copied in place, and the copies are what moves.
+void copySelectionInPlace(App& app) {
+    Timeline& timeline = app.session.timeline;
+    std::vector<TimelineEvent> copies;
+    std::set<uint64_t> copyIds;
+    for (const TimelineEvent& event : timeline.events) {
+        if (!app.selection.count(event.id)) continue;
+        TimelineEvent copy = event;
+        copy.id = timeline.nextId++;
+        if (event.id == app.dragEvent) app.dragEvent = copy.id;
+        copyIds.insert(copy.id);
+        copies.push_back(std::move(copy));
+    }
+    timeline.events.insert(timeline.events.end(), copies.begin(), copies.end());
+    std::stable_sort(timeline.events.begin(), timeline.events.end(),
+                     [](const TimelineEvent& a, const TimelineEvent& b) { return a.beat < b.beat; });
+    app.selection = std::move(copyIds);
+}
+
 void drawTimeline(App& app, ImVec2 size) {
     Timeline& timeline = app.session.timeline;
     const ImGuiIO& io = ImGui::GetIO();
     constexpr float kLabelWidth = 150.0f;
     constexpr float kRulerHeight = 18.0f;
-    constexpr float kLaneHeight = 20.0f;
+    constexpr float kLaneHeight = 34.0f;
     const double loop = timeline.loopBeats();
-    const double grid = kQuantizeOptions[static_cast<size_t>(app.session.quantizeIndex)].beats;
+    const double grid = gridBeats(app);
+    const double lastStart = loop - std::max(grid, 1e-3);
 
     std::vector<Lane> lanes;
     for (const TimelineEvent& event : timeline.events) {
@@ -2039,9 +2556,10 @@ void drawTimeline(App& app, ImVec2 size) {
         }
     };
 
-    // Ruler: click or drag to choose where playback starts.
+    // Ruler: click or drag to choose where Space starts playing, right-click to go back to the top.
     ImGui::SetCursorScreenPos(ImVec2(gridLeft, origin.y));
-    ImGui::InvisibleButton("##ruler", ImVec2(gridWidth, kRulerHeight));
+    ImGui::InvisibleButton("##ruler", ImVec2(gridWidth, kRulerHeight),
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
     ImDrawList* windowDraw = ImGui::GetWindowDrawList();
     if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         const double beat = std::clamp(snapBeat(xToBeat(io.MousePos.x), grid), 0.0, loop - 1e-3);
@@ -2049,7 +2567,15 @@ void drawTimeline(App& app, ImVec2 size) {
         app.playStart = beat;
         app.editCursor = beat;
         if (changed && playing && ImGui::IsItemActivated()) app.engine->play(beat);
+        if (ImGui::IsItemActivated() && beat > 0.0) {
+            app.status = "Space now plays from here. Right-click the ruler to play from the beginning again.";
+        }
     }
+    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        app.playStart = 0.0;
+        app.editCursor = 0.0;
+    }
+    ImGui::SetItemTooltip("Click to choose where Space starts playing. Right-click to start from the beginning.");
     windowDraw->AddRectFilled(ImVec2(gridLeft, origin.y), ImVec2(gridLeft + gridWidth, origin.y + kRulerHeight),
                               colors::kCell);
     const int labelEvery = std::max(1, static_cast<int>(std::ceil(28.0f / (gridWidth / static_cast<float>(timeline.bars)))));
@@ -2065,8 +2591,20 @@ void drawTimeline(App& app, ImVec2 size) {
         windowDraw->AddRectFilled(ImVec2(x - 1.5f, origin.y), ImVec2(x + 1.5f, origin.y + kRulerHeight), colors::kWave);
     }
     const float startX = beatToX(app.playStart);
-    windowDraw->AddTriangleFilled(ImVec2(startX - 5.0f, origin.y), ImVec2(startX + 5.0f, origin.y),
-                                  ImVec2(startX, origin.y + 8.0f), colors::kMarkerHot);
+    windowDraw->AddTriangleFilled(ImVec2(startX - 6.0f, origin.y), ImVec2(startX + 6.0f, origin.y),
+                                  ImVec2(startX, origin.y + 10.0f), colors::kMarkerHot);
+
+    // Above the lane names: what's selected, or which saved loop this is.
+    std::string heading;
+    if (!app.selection.empty()) {
+        heading = std::to_string(app.selection.size()) + " selected";
+    } else if (!app.session.editingLoop.empty()) {
+        heading = "Editing " + fs::path(app.session.editingLoop).stem().string();
+    }
+    if (!heading.empty()) {
+        windowDraw->AddText(ImVec2(origin.x + 6.0f, origin.y + 1.0f), app.selection.empty() ? colors::kDim : colors::kLabel,
+                            fitName(heading, kLabelWidth - 12.0f).c_str());
+    }
 
     ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + kRulerHeight));
     const float areaHeight = std::max(size.y - kRulerHeight, 20.0f);
@@ -2079,7 +2617,13 @@ void drawTimeline(App& app, ImVec2 size) {
     ImGui::InvisibleButton("##lanes", ImVec2(size.x, contentHeight),
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
     const bool hovered = ImGui::IsItemHovered();
+    const bool activated = ImGui::IsItemActivated();
     const float bottom = lanesOrigin.y + contentHeight;
+    const float visibleTop = lanesOrigin.y + ImGui::GetScrollY();
+    const auto laneAt = [&](float y) {
+        const float row = (y - lanesOrigin.y) / kLaneHeight;
+        return row >= 0.0f && row < static_cast<float>(lanes.size()) ? static_cast<long>(row) : -1L;
+    };
 
     drawGridLines(draw, lanesOrigin.y, bottom);
 
@@ -2089,8 +2633,8 @@ void drawTimeline(App& app, ImVec2 size) {
             draw->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + size.x, y + kLaneHeight), colors::kLaneTint);
         }
         const bool missing = findLoaded(app, lanes[i].path) == nullptr;
-        draw->AddText(ImVec2(origin.x + 6.0f, y + 3.0f), missing ? colors::kMissing : colors::kLabel,
-                      fitName(lanes[i].label, kLabelWidth - 10.0f).c_str());
+        draw->AddText(ImVec2(origin.x + 6.0f, y + (kLaneHeight - ImGui::GetTextLineHeight()) * 0.5f),
+                      missing ? colors::kMissing : colors::kLabel, fitName(lanes[i].label, kLabelWidth - 10.0f).c_str());
     }
 
     if (lanes.empty()) {
@@ -2101,11 +2645,17 @@ void drawTimeline(App& app, ImVec2 size) {
                       colors::kDim, hint);
     }
 
-    // Events: drawn in order, so the hit test keeps the topmost, the last one drawn.
+    // Where Space starts playing, when that isn't the beginning.
+    if (app.playStart > 0.0) {
+        draw->AddLine(ImVec2(startX, visibleTop), ImVec2(startX, visibleTop + areaHeight), IM_COL32(120, 220, 255, 110), 1.0f);
+    }
+
+    // Hits, each showing its waveform. Drawn in order, so the hit test keeps the topmost.
     uint64_t hoveredEvent = 0;
     bool hoveredEdge = false;
     double hoveredBeat = 0.0;
-    const double beatsPerFrame = timeline.bpm / 60.0 / app.sampleRate;
+    std::vector<HitBox> boxes;
+    const double framesPerPixel = loop / static_cast<double>(gridWidth) * 60.0 / timeline.bpm * app.sampleRate;
     for (const TimelineEvent& event : timeline.events) {
         if (event.beat >= loop) continue;
         const auto laneIt = std::find_if(lanes.begin(), lanes.end(), [&](const Lane& lane) {
@@ -2114,20 +2664,38 @@ void drawTimeline(App& app, ImVec2 size) {
         const size_t lane = static_cast<size_t>(laneIt - lanes.begin());
         const float y = lanesOrigin.y + kLaneHeight * static_cast<float>(lane) + 2.0f;
         const Playable playable = resolvePlayable(app, event.sound());
-        const double lengthBeats = event.durationBeats > 0.0
-                                       ? event.durationBeats
-                                       : static_cast<double>(playable.end - playable.start) * beatsPerFrame;
+        // The sound itself is solid, and any reverb or echo ringing on after it is faint.
+        const double fullLength = hitLengthBeats(app, event);
+        const double dryLength = std::min(dryLengthBeats(app, event), fullLength);
+        const float gridRight = gridLeft + gridWidth;
         const float x0 = beatToX(event.beat);
-        const float x1 = std::min(std::max(beatToX(event.beat + lengthBeats), x0 + 4.0f), gridLeft + gridWidth);
+        const float xDry = std::min(std::max(beatToX(event.beat + dryLength), x0 + 4.0f), gridRight);
+        const float xFull = std::min(std::max(beatToX(event.beat + fullLength), xDry), gridRight);
+        const float x1 = xDry;
         const float y1 = y + kLaneHeight - 4.0f;
+        boxes.push_back({event.id, ImVec2(x0, y), ImVec2(x1, y1)});
 
-        const bool missing = findLoaded(app, event.path) == nullptr;
+        const bool selected = app.selection.count(event.id) > 0;
+        const bool missing = playable.sample == nullptr;
         const float hue = std::fmod(static_cast<float>(lane) * 0.137f + 0.09f, 1.0f);
-        ImVec4 fill = ImColor::HSV(hue, 0.55f, event.gain < 0.9f ? 0.55f : 0.9f);
-        if (missing) fill = ImColor(colors::kMissing);
-        draw->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y1), ImGui::ColorConvertFloat4ToU32(fill), 2.0f);
-        if (app.hasSelected && event.sound() == app.selected) {
-            draw->AddRect(ImVec2(x0, y), ImVec2(x1, y1), IM_COL32(255, 255, 255, 170), 2.0f);
+        const ImU32 fill = missing ? colors::kMissing
+                                   : static_cast<ImU32>(ImColor::HSV(hue, 0.5f, selected ? 0.5f : 0.3f));
+        const ImU32 wave = ImColor::HSV(hue, 0.4f, 1.0f, event.gain < 0.9f ? 0.6f : 0.95f);
+        if (xFull > xDry) {
+            draw->AddRectFilled(ImVec2(xDry - 3.0f, y), ImVec2(xFull, y1), ImColor::HSV(hue, 0.5f, 0.3f, 0.3f), 3.0f);
+        }
+        draw->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y1), fill, 3.0f);
+        if (playable.sample) {
+            draw->PushClipRect(ImVec2(x0, y), ImVec2(xFull, y1), true);
+            drawHitWave(draw, *playable.sample, playable.start, playable.end, event.reverse,
+                        settingsFor(app, event.sound()).loop, framesPerPixel, x0, x1, (y + y1) * 0.5f,
+                        (y1 - y) * 0.45f * std::min(event.gain, 1.0f), wave);
+            draw->PopClipRect();
+        }
+        if (selected) {
+            draw->AddRect(ImVec2(x0, y), ImVec2(x1, y1), IM_COL32(255, 255, 255, 235), 3.0f, 0, 2.0f);
+        } else if (app.hasSelected && event.sound() == app.selected) {
+            draw->AddRect(ImVec2(x0, y), ImVec2(x1, y1), IM_COL32(255, 255, 255, 90), 3.0f);
         }
         if (event.reverse) draw->AddTriangleFilled(ImVec2(x0 + 8.0f, y + 2.0f), ImVec2(x0 + 8.0f, y1 - 2.0f),
                                                    ImVec2(x0 + 2.0f, (y + y1) * 0.5f), IM_COL32(0, 0, 0, 170));
@@ -2143,81 +2711,168 @@ void drawTimeline(App& app, ImVec2 size) {
         return std::find_if(timeline.events.begin(), timeline.events.end(),
                             [id](const TimelineEvent& e) { return e.id == id; });
     };
+    const double mouseBeat = xToBeat(io.MousePos.x);
+    const double clickBeat = std::clamp(snapBeat(mouseBeat, grid), 0.0, lastStart);
+    const bool inGrid = io.MousePos.x >= gridLeft;
 
-    if (hovered && hoveredEvent != 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-        pushUndo(app);
-        timeline.events.erase(eventWithId(hoveredEvent));
-        hoveredEvent = 0;
-        publishSequence(app);
-        markSessionDirty(app);
-    }
-    if (ImGui::IsItemActivated() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hoveredEvent != 0) {
-        pushUndo(app);
-        app.dragEvent = hoveredEvent;
-        app.dragResize = hoveredEdge;
-        app.dragOffset = xToBeat(io.MousePos.x) - hoveredBeat;
-        const auto event = eventWithId(hoveredEvent);
-        if (!hoveredEdge) {
-            SoundRef sound;
-            sound.path = event->path;
-            sound.sample = findLoaded(app, event->path);
-            sound.start = event->start;
-            sound.end = event->end;
-            playSound(app, sound, kAuditionVoiceKey, event->gain, event->reverse, false);
-        }
-    } else if (hovered && hoveredEvent == 0 && io.MousePos.x >= gridLeft) {
-        const double clickBeat = std::clamp(snapBeat(xToBeat(io.MousePos.x), grid), 0.0, loop - std::max(grid, 1e-3));
-        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            // Double-click a lane to add another hit of its sound there.
-            const auto lane = static_cast<size_t>(std::max(0.0f, (io.MousePos.y - lanesOrigin.y) / kLaneHeight));
-            if (lane < lanes.size()) {
-                addPlacedHit(app, {lanes[lane].path, lanes[lane].start, lanes[lane].end}, clickBeat, 1.0f, false);
-            }
-        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    // Right-click: a menu for the hits, or for the empty spot.
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        if (hoveredEvent != 0) {
+            if (!app.selection.count(hoveredEvent)) app.selection = {hoveredEvent};
+            ImGui::OpenPopup("hit menu");
+        } else if (inGrid) {
             app.editCursor = clickBeat;
+            ImGui::OpenPopup("space menu");
         }
     }
+    if (ImGui::BeginPopup("hit menu")) {
+        if (ImGui::MenuItem("Copy", "Cmd+C")) copySelection(app);
+        if (ImGui::MenuItem("Cut", "Cmd+X")) cutSelection(app);
+        if (ImGui::MenuItem("Duplicate", "Cmd+D")) duplicateSelection(app);
+        ImGui::Separator();
+        if (ImGui::MenuItem(app.selection.size() > 1 ? "Delete hits" : "Delete", "Delete")) deleteSelection(app);
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopup("space menu")) {
+        if (ImGui::MenuItem("Paste here", "Cmd+V", false, !app.clipboard.empty())) pasteClipboard(app);
+        if (ImGui::MenuItem("Select all", "Cmd+A", false, !timeline.events.empty())) selectAll(app);
+        if (ImGui::MenuItem("Select none", "Esc", false, !app.selection.empty())) app.selection.clear();
+        ImGui::EndPopup();
+    }
+
+    if (activated && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (!inGrid) {
+            // A lane's name selects all of its hits.
+            const long lane = laneAt(io.MousePos.y);
+            if (lane >= 0) {
+                const Lane& picked = lanes[static_cast<size_t>(lane)];
+                if (!io.KeyShift) app.selection.clear();
+                for (const TimelineEvent& event : timeline.events) {
+                    if (event.path == picked.path && event.start == picked.start && event.end == picked.end) {
+                        app.selection.insert(event.id);
+                    }
+                }
+                SoundRef sound;
+                sound.path = picked.path;
+                sound.sample = findLoaded(app, picked.path);
+                sound.start = picked.start;
+                sound.end = picked.end;
+                playSound(app, sound, kAuditionVoiceKey, 1.0f, false, false);
+            }
+        } else if (hoveredEvent != 0) {
+            if (io.KeyShift && app.selection.count(hoveredEvent)) {
+                app.selection.erase(hoveredEvent);
+            } else if (io.KeyShift) {
+                app.selection.insert(hoveredEvent);
+            } else if (!app.selection.count(hoveredEvent)) {
+                app.selection = {hoveredEvent};
+            }
+            if (app.selection.count(hoveredEvent)) {
+                pushUndo(app);
+                app.dragEvent = hoveredEvent;
+                app.dragResize = hoveredEdge;
+                app.dragOffset = mouseBeat - hoveredBeat;
+                if (!hoveredEdge) {
+                    const auto event = eventWithId(hoveredEvent);
+                    SoundRef sound;
+                    sound.path = event->path;
+                    sound.sample = findLoaded(app, event->path);
+                    sound.start = event->start;
+                    sound.end = event->end;
+                    const float gain = event->gain;
+                    const bool reverse = event->reverse;
+                    if (io.KeyAlt) copySelectionInPlace(app);
+                    for (const TimelineEvent& e : timeline.events) {
+                        if (app.selection.count(e.id)) app.dragOrigins[e.id] = e.beat;
+                    }
+                    playSound(app, sound, kAuditionVoiceKey, gain, reverse, false);
+                }
+            }
+        } else if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            // Double-click a lane to add another hit of its sound there.
+            const long lane = laneAt(io.MousePos.y);
+            if (lane >= 0) {
+                const Lane& picked = lanes[static_cast<size_t>(lane)];
+                addPlacedHit(app, {picked.path, picked.start, picked.end}, clickBeat, 1.0f, false);
+            }
+        } else {
+            // Empty space moves the cursor. Dragging from it selects everything it touches.
+            if (!io.KeyShift) app.selection.clear();
+            app.editCursor = clickBeat;
+            app.boxSelecting = true;
+            app.boxStart = io.MousePos;
+            app.boxBase = app.selection;
+        }
+    }
+
     if (app.dragEvent != 0) {
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            app.dragEvent = 0;
-            app.dragResize = false;
-            std::stable_sort(timeline.events.begin(), timeline.events.end(),
-                             [](const TimelineEvent& a, const TimelineEvent& b) { return a.beat < b.beat; });
-            markSessionDirty(app);
-        } else {
+            finishDrag(app);
+        } else if (app.dragResize) {
             const auto event = eventWithId(app.dragEvent);
-            if (event != timeline.events.end() && app.dragResize) {
+            if (event != timeline.events.end()) {
                 const double step = grid > 0.0 ? grid : 1.0 / 64.0;
-                const double length = std::clamp(snapBeat(xToBeat(io.MousePos.x), grid) - event->beat, step, loop - event->beat);
+                const double length = std::clamp(snapBeat(mouseBeat, grid) - event->beat, step, loop - event->beat);
                 if (length != event->durationBeats) {
                     event->durationBeats = length;
                     publishSequence(app);
                 }
-            } else if (event != timeline.events.end()) {
-                const double beat = snapBeat(xToBeat(io.MousePos.x) - app.dragOffset, grid);
-                const double clamped = std::clamp(beat, 0.0, loop - std::max(grid, 1e-3));
-                if (clamped != event->beat) {
-                    event->beat = clamped;
-                    publishSequence(app);
+            }
+        } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 3.0f)) {
+            // Everything selected moves together, keeping its spacing and staying on the timeline.
+            const auto anchor = app.dragOrigins.find(app.dragEvent);
+            if (anchor != app.dragOrigins.end()) {
+                double earliest = loop;
+                double latest = 0.0;
+                for (const auto& [id, beat] : app.dragOrigins) {
+                    earliest = std::min(earliest, beat);
+                    latest = std::max(latest, beat);
                 }
+                const double wanted = snapBeat(mouseBeat - app.dragOffset, grid) - anchor->second;
+                const double delta = std::clamp(wanted, -earliest, std::max(lastStart - latest, -earliest));
+                bool moved = false;
+                for (TimelineEvent& event : timeline.events) {
+                    const auto origin = app.dragOrigins.find(event.id);
+                    if (origin == app.dragOrigins.end() || event.beat == origin->second + delta) continue;
+                    event.beat = origin->second + delta;
+                    moved = true;
+                }
+                if (moved) publishSequence(app);
             }
         }
     }
-    if (hoveredEdge || app.dragResize) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-    if (hoveredEvent != 0 && app.dragEvent == 0) {
-        ImGui::SetItemTooltip("Drag to move, drag the right edge to change length, right-click to delete");
+
+    if (app.boxSelecting) {
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            app.boxSelecting = false;
+        } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 3.0f)) {
+            const ImVec2 a(std::min(app.boxStart.x, io.MousePos.x), std::min(app.boxStart.y, io.MousePos.y));
+            const ImVec2 b(std::max(app.boxStart.x, io.MousePos.x), std::max(app.boxStart.y, io.MousePos.y));
+            app.selection = app.boxBase;
+            for (const HitBox& box : boxes) {
+                if (box.max.x >= a.x && box.min.x <= b.x && box.max.y >= a.y && box.min.y <= b.y) app.selection.insert(box.id);
+            }
+            draw->AddRectFilled(a, b, IM_COL32(120, 220, 255, 22));
+            draw->AddRect(a, b, IM_COL32(120, 220, 255, 150));
+        }
     }
 
-    if (app.placeMode) {
-        const float x = beatToX(app.editCursor);
-        draw->AddLine(ImVec2(x, lanesOrigin.y + ImGui::GetScrollY()),
-                      ImVec2(x, lanesOrigin.y + ImGui::GetScrollY() + areaHeight), colors::kWave, 2.0f);
+    if (hoveredEdge || app.dragResize) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (hoveredEvent != 0 && app.dragEvent == 0) {
+        ImGui::SetItemTooltip("Drag to move, Option-drag to copy, Shift-click to add to the selection. "
+                              "Drag the right edge to change its length. Right-click for more.");
+    } else if (hovered && !inGrid && laneAt(io.MousePos.y) >= 0 && app.dragEvent == 0) {
+        ImGui::SetItemTooltip("Click to select all of this sound's hits");
     }
+
+    // The cursor, where pasting and Place mode put things.
+    const float cursorX = beatToX(app.editCursor);
+    draw->AddLine(ImVec2(cursorX, visibleTop), ImVec2(cursorX, visibleTop + areaHeight),
+                  app.placeMode ? colors::kWave : IM_COL32(236, 174, 66, 120), app.placeMode ? 2.0f : 1.0f);
 
     if (playing && playhead >= 0.0) {
         const float x = beatToX(playhead);
-        draw->AddLine(ImVec2(x, lanesOrigin.y + ImGui::GetScrollY()),
-                      ImVec2(x, lanesOrigin.y + ImGui::GetScrollY() + areaHeight),
+        draw->AddLine(ImVec2(x, visibleTop), ImVec2(x, visibleTop + areaHeight),
                       app.recording ? IM_COL32(255, 90, 75, 255) : colors::kPlayhead, 1.5f);
     }
     ImGui::EndChild();
@@ -2391,6 +3046,7 @@ struct SelfTest {
     size_t kitsAtStart = 0;
     bool newKitEmpty = false;
     bool switchedBack = false;
+    bool keyLit = false;
 };
 
 int stepSelfTest(App& app, SelfTest& test, long frame, int width, int height) {
@@ -2489,6 +3145,13 @@ int stepSelfTest(App& app, SelfTest& test, long frame, int width, int height) {
         tap(GLFW_KEY_MINUS);
         test.switchedBack = session.currentKit == static_cast<int>(session.kits.size()) - 2;
     }
+    // A key stays lit while its sound plays.
+    if (t == 230) {
+        app.engine->stopAll();
+        switchKit(app, 0);  // earlier runs leave empty test kits behind
+        tap(GLFW_KEY_1);
+    }
+    if (t == 232) test.keyLit = keyActivity(app, keySound(app, 0)).progress >= 0.0f;
     if (t < 235) return -1;
 
     int failures = 0;
@@ -2533,7 +3196,7 @@ int stepSelfTest(App& app, SelfTest& test, long frame, int width, int height) {
     float peak = 0.0f;
     for (float value : loop->stereo) peak = std::max(peak, std::fabs(value));
     check(peak > 0.01f, "the bounced loop contains sound");
-    check(saveNewSound(app, loop, "Self test loop", false), "the bounced loop saved as a sound");
+    check(!saveNewSound(app, loop, "Self test loop", false).empty(), "the bounced loop saved as a sound");
     check(app.sounds.size() >= test.soundsAtStart + 1, "saved sounds are listed");
 
     const auto recorded = app.session.timeline.events;
@@ -2543,7 +3206,69 @@ int stepSelfTest(App& app, SelfTest& test, long frame, int width, int height) {
     check(app.session.timeline.events.size() + 1 == test.eventsBeforePlacing + test.placedEvents ||
               test.placedEvents == 0,
           "undo removes the last change");
+    check(test.keyLit, "a key is lit while its sound plays");
+
+    // Copying hits around: duplicate one, then copy both and paste them a bar later.
+    Timeline& timeline = session.timeline;
+    timeline.events.clear();
+    app.selection.clear();
+    const Sample* firstSound = findLoaded(app, session.kits[0].keys[0]);
+    if (!firstSound) {
+        check(false, "the kit's first sound is loaded");
+        return 2;
+    }
+    const SoundKey first{session.kits[0].keys[0], 0, firstSound->frames};
+    addPlacedHit(app, first, 0.0, 1.0f, false);
+    selectAll(app);
+    onKey(app, GLFW_KEY_D, GLFW_PRESS, GLFW_MOD_SUPER);
+    const bool duplicated = timeline.events.size() == 2 && timeline.events[1].beat > 0.0;
+    selectAll(app);
+    onKey(app, GLFW_KEY_C, GLFW_PRESS, GLFW_MOD_SUPER);
+    app.editCursor = 4.0;
+    onKey(app, GLFW_KEY_V, GLFW_PRESS, GLFW_MOD_SUPER);
+    check(duplicated && timeline.events.size() == 4 && timeline.events[2].beat == 4.0 &&
+              timeline.events[3].beat == 4.0 + timeline.events[1].beat,
+          "hits can be duplicated, copied and pasted");
+    app.selection = {timeline.events[3].id};
+    onKey(app, GLFW_KEY_BACKSPACE, GLFW_PRESS, 0);
+    check(timeline.events.size() == 3 && app.selection.empty(), "Delete removes the selected hits");
+
+    // A saved loop keeps its arrangement, opens again for editing, and saves over itself.
+    app.pendingSound = bounceLoop(app);
+    app.pendingIsLoop = true;
+    app.replacing.clear();
+    std::snprintf(app.nameBuffer.data(), app.nameBuffer.size(), "Self test arrangement");
+    app.addToKit = false;
+    savePendingLoop(app);
+    const fs::path savedLoop = session.editingLoop;
+    check(!savedLoop.empty() && fs::exists(arrangementPath(savedLoop)) && app.editableLoops.count(savedLoop),
+          "a saved loop keeps its arrangement");
+    const double savedBpm = timeline.bpm;
+    timeline.events.clear();
+    timeline.bpm = 100.0;
+    session.editingLoop.clear();
+    if (!savedLoop.empty()) openLoopForEditing(app, savedLoop);
+    check(timeline.events.size() == 3 && timeline.bpm == savedBpm && session.editingLoop == savedLoop.string(),
+          "a saved loop opens on the timeline again");
+    timeline.events.pop_back();
+    requestSaveLoop(app);
+    check(app.replacing == savedLoop && app.replaceLoop, "saving again offers to update it");
+    const Sample* before = findLoaded(app, savedLoop.string());
+    savePendingLoop(app);
+    check(findLoaded(app, savedLoop.string()) != before && session.editingLoop == savedLoop.string(),
+          "updating it replaces the sound everywhere");
+    Session reread;
+    check(loadSession(reread, arrangementPath(savedLoop).string(), app.sampleRate) && reread.timeline.events.size() == 2,
+          "and its arrangement");
+    app.pendingSound.reset();
+    app.pendingIsLoop = false;
+    app.replacing.clear();
+    app.nameOpen = false;
+    performUndo(app);  // back from opening it
+    check(timeline.events.empty() && timeline.bpm == 100.0, "undo puts back what was there before opening it");
+
     app.session.timeline.events = recorded;  // keep the take for the next run's restore check
+    app.session.timeline.bpm = savedBpm;
     return failures == 0 ? 0 : 2;
 }
 

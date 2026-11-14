@@ -82,6 +82,8 @@ public:
     int64_t voicePosition(int voice) const { return positions_[voice].load(std::memory_order_relaxed); }
     // For comparing only: the sample a voice is playing.
     const Sample* voiceSample(int voice) const { return voiceSamples_[voice].load(std::memory_order_relaxed); }
+    // True for a voice held still by a pause.
+    bool voiceFrozen(int voice) const { return voiceFrozen_[voice].load(std::memory_order_relaxed); }
     double transportBeat() const { return publishedBeat_.load(std::memory_order_relaxed); }
     bool transportPlaying() const { return publishedPlaying_.load(std::memory_order_relaxed); }
     bool paused() const { return publishedPaused_.load(std::memory_order_relaxed); }
@@ -145,6 +147,7 @@ private:
     std::array<Voice, kMaxVoices> voices_{};
     std::array<std::atomic<int64_t>, kMaxVoices> positions_{};
     std::array<std::atomic<const Sample*>, kMaxVoices> voiceSamples_{};
+    std::array<std::atomic<bool>, kMaxVoices> voiceFrozen_{};
     uint64_t voiceCounter_ = 0;
     std::array<uint64_t, kMaxVoices> voiceOrder_{};
 

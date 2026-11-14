@@ -83,19 +83,50 @@ double snapLoopBeats(double beats) {
     return std::max(0.25, std::pow(2.0, std::round(std::log2(std::max(beats, 0.0625)))));
 }
 
+}  // namespace
+
+LoopPlan planLoop(size_t frames, double sourceBpm, uint32_t rate) {
+    if (sourceBpm <= 0.0 || frames == 0 || rate == 0) return {frames, sourceBpm};
+    const double beats = static_cast<double>(frames) / rate * sourceBpm / 60.0;
+    const double snapped = snapLoopBeats(beats);
+    const auto framesFor = [&](double b) {
+        return std::min(frames, static_cast<size_t>(std::llround(b * 60.0 / sourceBpm * rate)));
+    };
+    // Longer than a musical length: the rest is a tail, as in a sampled break, so it's trimmed.
+    if (snapped <= beats + 1e-9) return {framesFor(snapped), sourceBpm};
+    // A little short: the tempo is slightly off, so the sound itself is that many beats.
+    // Padding it out instead would leave a gap of silence every time round.
+    if (snapped <= beats * 1.06) return {frames, sourceBpm * snapped / beats};
+    // Well short: it's an odd length, kept to the nearest 16th note below.
+    const double sixteenths = std::floor(beats * 4.0 + 1e-6) / 4.0;
+    if (sixteenths >= 0.25) return {framesFor(sixteenths), sourceBpm};
+    return {frames, sourceBpm};
+}
+
+namespace {
+
 void applyPitchAndTime(Channel& left, Channel& right, const SoundSettings& s, double bpm, uint32_t rate) {
-    if (s.loop && s.sourceBpm > 0.0f) {
-        const double beats = static_cast<double>(left.size()) / rate * s.sourceBpm / 60.0;
-        const auto length = static_cast<size_t>(std::llround(snapLoopBeats(beats) * 60.0 / s.sourceBpm * rate));
-        left.resize(length, 0.0f);
-        right.resize(length, 0.0f);
+    double sourceBpm = s.sourceBpm;
+    if (s.loop && sourceBpm > 0.0) {
+        const LoopPlan plan = planLoop(left.size(), sourceBpm, rate);
+        left.resize(plan.frames);
+        right.resize(plan.frames);
+        sourceBpm = plan.sourceBpm;
+    } else if (s.loop) {
+        // With no tempo to go by, trailing silence is just a gap before it comes round again.
+        size_t used = left.size();
+        while (used > 0 && std::fabs(left[used - 1]) < 1e-3f && std::fabs(right[used - 1]) < 1e-3f) --used;
+        if (used > 0) {
+            left.resize(used);
+            right.resize(used);
+        }
     }
 
     const bool hasPitch = std::fabs(s.pitch) > 1e-3f;
-    const bool fit = s.fit && s.sourceBpm > 0.0f && bpm > 0.0;
+    const bool fit = s.fit && sourceBpm > 0.0 && bpm > 0.0;
     if (fit) {
         const auto target = static_cast<size_t>(
-            std::llround(static_cast<double>(left.size()) * static_cast<double>(s.sourceBpm) / bpm));
+            std::llround(static_cast<double>(left.size()) * sourceBpm / bpm));
         if (s.fitRepitch) {
             left = resampled(left, target);
             right = resampled(right, target);
@@ -349,7 +380,7 @@ void SoundSettings::applyEcho() {
 }
 
 bool SoundSettings::isNeutral() const {
-    return std::fabs(pitch) < 1e-3f && !fit && !(loop && sourceBpm > 0.0f) && level == 0.0f && pan == 0.0f &&
+    return std::fabs(pitch) < 1e-3f && !fit && !loop && level == 0.0f && pan == 0.0f &&
            fadeInMs <= 0.0f && fadeOutMs <= 0.0f && filterType == 0 && drive <= 0.0f && crushBits >= 16.0f &&
            crushDownsample <= 1.0f && !compressor && delayMix <= 0.0f && reverbMix <= 0.0f;
 }
