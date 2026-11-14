@@ -161,10 +161,19 @@ bool saveSession(const Session& session, const std::string& path) {
     return !error;
 }
 
+namespace {
+// Accepts Windows line endings too, in case the file was edited by hand.
+bool readLine(std::istream& in, std::string& line) {
+    if (!std::getline(in, line)) return false;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return true;
+}
+}  // namespace
+
 bool loadSession(Session& session, const std::string& path, uint32_t targetRate, int* version) {
     std::ifstream file(path, std::ios::binary);
     std::string line;
-    if (!file || !std::getline(file, line) || (line != kHeader && line != kHeaderV1)) return false;
+    if (!file || !readLine(file, line) || (line != kHeader && line != kHeaderV1)) return false;
     if (version) *version = line == kHeader ? 2 : 1;
 
     Session loaded;
@@ -175,7 +184,7 @@ bool loadSession(Session& session, const std::string& path, uint32_t targetRate,
         if (savedRate == targetRate || savedRate == 0) return frame;
         return static_cast<size_t>(static_cast<double>(frame) * targetRate / savedRate);
     };
-    while (std::getline(file, line)) {
+    while (readLine(file, line)) {
         const auto tab = line.find('\t');
         if (tab == std::string::npos) continue;
         const std::string key = line.substr(0, tab);
