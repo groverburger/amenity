@@ -1,5 +1,21 @@
 cmake_minimum_required(VERSION 3.25)
-project(amenity LANGUAGES C CXX)
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0 CACHE STRING "Minimum macOS version")
+endif()
+# Link the C runtime statically on Windows so the .exe runs without installing anything.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+project(amenity VERSION 0.1.0 LANGUAGES C CXX)
+
+option(AMENITY_APP_BUNDLE "Build Amenity.app on macOS instead of a plain executable" OFF)
+
+if(MSVC)
+  set(AMENITY_WARNINGS /W3)
+  add_compile_options(/utf-8)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
+else()
+  set(AMENITY_WARNINGS -Wall -Wextra)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,25 +69,43 @@ target_include_directories(imgui_lib SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_S
 target_link_libraries(imgui_lib PUBLIC glfw)
 
 # Everything testable without a window or an audio device.
-add_library(amenity_core STATIC src/sample.cpp src/slicer.cpp src/engine.cpp src/timeline.cpp src/effects.cpp)
+add_library(amenity_core STATIC src/sample.cpp src/slicer.cpp src/engine.cpp src/timeline.cpp src/effects.cpp
+  src/platform.cpp)
 target_include_directories(amenity_core PUBLIC src)
 target_link_libraries(amenity_core PUBLIC miniaudio_impl)
 target_link_libraries(amenity_core PRIVATE signalsmith-stretch)
-target_compile_options(amenity_core PRIVATE -Wall -Wextra)
+target_compile_options(amenity_core PRIVATE ${AMENITY_WARNINGS})
 
 add_executable(amenity src/main.cpp)
 target_link_libraries(amenity PRIVATE amenity_core imgui_lib glfw)
-target_compile_options(amenity PRIVATE -Wall -Wextra)
+target_compile_options(amenity PRIVATE ${AMENITY_WARNINGS})
 
 add_executable(amenity_tests tests/tests.cpp)
 target_link_libraries(amenity_tests PRIVATE amenity_core)
-target_compile_options(amenity_tests PRIVATE -Wall -Wextra)
+target_compile_options(amenity_tests PRIVATE ${AMENITY_WARNINGS})
 
 if(APPLE)
   set(APPLE_AUDIO_FRAMEWORKS
     "-framework CoreFoundation" "-framework CoreAudio" "-framework AudioToolbox")
   target_link_libraries(miniaudio_impl PUBLIC ${APPLE_AUDIO_FRAMEWORKS})
   target_link_libraries(amenity PRIVATE "-framework OpenGL")
+  if(AMENITY_APP_BUNDLE)
+    set_target_properties(amenity PROPERTIES
+      MACOSX_BUNDLE TRUE
+      OUTPUT_NAME amenity
+      MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_BINARY_DIR}/Info.plist)
+    configure_file(packaging/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist)
+  endif()
+elseif(WIN32)
+  target_link_libraries(amenity_core PUBLIC mfplat mfreadwrite mfuuid ole32 shell32)
+  target_link_libraries(amenity PRIVATE opengl32)
+  target_sources(amenity PRIVATE packaging/amenity.manifest)
+  target_sources(amenity_tests PRIVATE packaging/amenity.manifest)
+  # A windowed app with no console, still starting at main().
+  set_target_properties(amenity PROPERTIES WIN32_EXECUTABLE TRUE)
+  if(MSVC)
+    target_link_options(amenity PRIVATE /ENTRY:mainCRTStartup)
+  endif()
 endif()
 
 enable_testing()

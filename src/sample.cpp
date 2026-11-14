@@ -8,6 +8,14 @@
 #if defined(__APPLE__)
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
 #endif
 
 void finalizeSample(Sample& s) {
@@ -94,6 +102,82 @@ bool decodeWithCoreAudio(const std::string& path, uint32_t rate, std::vector<flo
     ExtAudioFileDispose(file);
     return ok;
 }
+#elif defined(_WIN32)
+// Handles what miniaudio doesn't, such as M4A/AAC and WMA, with Media Foundation.
+bool decodeWithMediaFoundation(const std::string& path, uint32_t rate, std::vector<float>& out) {
+    // Paths are UTF-8 (the app's manifest sets that code page).
+    const int wideLength = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wideLength <= 0) return false;
+    std::wstring widePath(static_cast<size_t>(wideLength), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, widePath.data(), wideLength);
+
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) {
+        if (SUCCEEDED(com)) CoUninitialize();
+        return false;
+    }
+
+    // Decode to 32-bit float at the file's own rate and channel count, then convert below.
+    std::vector<float> decoded;
+    UINT32 channels = 0;
+    UINT32 fileRate = 0;
+    bool ok = false;
+    IMFSourceReader* reader = nullptr;
+    if (SUCCEEDED(MFCreateSourceReaderFromURL(widePath.c_str(), nullptr, &reader))) {
+        const DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM);
+        reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+        reader->SetStreamSelection(stream, TRUE);
+        IMFMediaType* request = nullptr;
+        if (SUCCEEDED(MFCreateMediaType(&request))) {
+            request->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            request->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
+            ok = SUCCEEDED(reader->SetCurrentMediaType(stream, nullptr, request));
+            request->Release();
+        }
+        IMFMediaType* actual = nullptr;
+        if (ok && SUCCEEDED(reader->GetCurrentMediaType(stream, &actual))) {
+            actual->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels);
+            actual->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &fileRate);
+            actual->Release();
+        }
+        ok = ok && channels > 0 && fileRate > 0;
+        while (ok) {
+            DWORD flags = 0;
+            IMFSample* sample = nullptr;
+            if (FAILED(reader->ReadSample(stream, 0, nullptr, &flags, nullptr, &sample))) {
+                ok = false;
+                break;
+            }
+            if (sample) {
+                IMFMediaBuffer* buffer = nullptr;
+                if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buffer))) {
+                    BYTE* data = nullptr;
+                    DWORD bytes = 0;
+                    if (SUCCEEDED(buffer->Lock(&data, nullptr, &bytes))) {
+                        const auto* floats = reinterpret_cast<const float*>(data);
+                        decoded.insert(decoded.end(), floats, floats + bytes / sizeof(float));
+                        buffer->Unlock();
+                    }
+                    buffer->Release();
+                }
+                sample->Release();
+            }
+            if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) break;
+        }
+        reader->Release();
+    }
+    MFShutdown();
+    if (SUCCEEDED(com)) CoUninitialize();
+    if (!ok || decoded.empty()) return false;
+
+    const ma_uint64 inFrames = decoded.size() / channels;
+    const ma_uint64 outFrames =
+        ma_convert_frames(nullptr, 0, ma_format_f32, 2, rate, decoded.data(), inFrames, ma_format_f32, channels, fileRate);
+    out.assign(static_cast<size_t>(outFrames) * 2, 0.0f);
+    out.resize(static_cast<size_t>(ma_convert_frames(out.data(), outFrames, ma_format_f32, 2, rate, decoded.data(), inFrames,
+                                                     ma_format_f32, channels, fileRate)) * 2);
+    return !out.empty();
+}
 #endif
 
 }  // namespace
@@ -126,6 +210,8 @@ std::shared_ptr<Sample> loadSample(const std::string& path, uint32_t targetRate,
     bool ok = decodeWithMiniaudio(path, targetRate, sample->stereo);
 #if defined(__APPLE__)
     if (!ok || sample->stereo.empty()) ok = decodeWithCoreAudio(path, targetRate, sample->stereo);
+#elif defined(_WIN32)
+    if (!ok || sample->stereo.empty()) ok = decodeWithMediaFoundation(path, targetRate, sample->stereo);
 #endif
     if (!ok || sample->stereo.empty()) {
         error = "Couldn't decode " + std::filesystem::path(path).filename().string();

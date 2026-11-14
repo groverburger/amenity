@@ -1,9 +1,12 @@
 // Amenity: window, keyboard handling and UI.
 #define GL_SILENCE_DEPRECATION
+#if defined(__APPLE__)
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <OpenGL/gl3.h>
-#include <CoreFoundation/CoreFoundation.h>
+#else
+#include <GLFW/glfw3.h>  // brings in the system OpenGL header, enough for the few calls made here
+#endif
 
 #include <algorithm>
 #include <array>
@@ -28,6 +31,7 @@
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+#include "platform.h"
 #include "miniaudio.h"
 #include "sample.h"
 #include "slicer.h"
@@ -42,6 +46,14 @@ constexpr int kRows = 4;
 constexpr int kMouseVoiceKey = -2;
 constexpr int kAuditionVoiceKey = -1;
 constexpr float kGhostGain = 0.45f;
+// Cmd on macOS and Ctrl elsewhere runs shortcuts; the other one is left to the system.
+#if defined(__APPLE__)
+constexpr int kShortcutMod = GLFW_MOD_SUPER;
+constexpr int kIgnoredMod = GLFW_MOD_CONTROL;
+#else
+constexpr int kShortcutMod = GLFW_MOD_CONTROL;
+constexpr int kIgnoredMod = GLFW_MOD_SUPER;
+#endif
 constexpr double kCountInBeats = 4.0;
 constexpr size_t kMaxUndo = 100;
 constexpr int kNoKitDialog = -1;
@@ -442,7 +454,7 @@ void deleteSelection(App& app) {
 void copySelection(App& app) {
     if (app.selection.empty()) return;
     app.clipboard = copyEvents(app.session.timeline, app.selection);
-    app.status = "Copied " + std::to_string(app.clipboard.size()) + " hit(s). Cmd+V pastes them at the cursor.";
+    app.status = "Copied " + std::to_string(app.clipboard.size()) + " hit(s). " AMENITY_CMD "V pastes them at the cursor.";
 }
 
 void cutSelection(App& app) {
@@ -454,7 +466,7 @@ void cutSelection(App& app) {
 // Pastes at the cursor, then moves the cursor on, so pasting again lays the copies end to end.
 void pasteClipboard(App& app) {
     if (app.clipboard.empty()) {
-        app.status = "Nothing copied yet. Select hits and press Cmd+C.";
+        app.status = "Nothing copied yet. Select hits and press " AMENITY_CMD "C.";
         return;
     }
     pushUndo(app);
@@ -825,7 +837,7 @@ void openLoopForEditing(App& app, const fs::path& sound) {
     applyTransportSettings(app);
     publishSequence(app);
     markSessionDirty(app);
-    app.status = "Editing " + sound.stem().string() + ". Save loop updates it everywhere it's used; Cmd+Z puts back what was here.";
+    app.status = "Editing " + sound.stem().string() + ". Save loop updates it everywhere it's used; " AMENITY_CMD "Z puts back what was here.";
 }
 
 // Moves settings, processed copies and hits from one frame range of a file to another.
@@ -1029,23 +1041,12 @@ void renameSound(App& app, const fs::path& from, const std::string& name) {
 }
 
 void trashSound(App& app, const fs::path& path) {
-    const char* home = std::getenv("HOME");
-    const fs::path trash = fs::path(home ? home : ".") / ".Trash";
-    fs::path target = trash / path.filename();
-    for (int n = 2; fs::exists(target); ++n) {
-        target = trash / (path.stem().string() + " " + std::to_string(n) + path.extension().string());
-    }
-    std::error_code error;
-    fs::rename(path, target, error);
-    if (error) {
-        app.status = "Couldn't move " + path.filename().string() + " to the Trash";
+    std::vector<fs::path> files{path};
+    // A saved loop's arrangement goes with it.
+    if (fs::exists(arrangementPath(path))) files.push_back(arrangementPath(path));
+    if (!platform::moveToTrash(files)) {
+        app.status = "Couldn't move " + path.filename().string() + " to the " AMENITY_TRASH;
         return;
-    }
-    const fs::path arrangement = arrangementPath(path);
-    if (fs::exists(arrangement)) {
-        fs::path arrangementTarget = target;
-        arrangementTarget.replace_extension(kArrangementExtension);
-        fs::rename(arrangement, arrangementTarget, error);
     }
     if (app.session.editingLoop == path.string()) app.session.editingLoop.clear();
     for (Kit& kit : app.session.kits) {
@@ -1056,7 +1057,7 @@ void trashSound(App& app, const fs::path& path) {
     // Stays loaded until exit: an undo may still bring back hits that use it.
     refreshSounds(app);
     markSessionDirty(app);
-    app.status = "Moved " + path.filename().string() + " to the Trash";
+    app.status = "Moved " + path.filename().string() + " to the " AMENITY_TRASH;
 }
 
 // ---- Loading ---------------------------------------------------------------
@@ -1353,8 +1354,8 @@ void onKey(App& app, int key, int action, int mods) {
         }
         return;
     }
-    if (app.textFocused || (mods & GLFW_MOD_CONTROL)) return;
-    if (mods & GLFW_MOD_SUPER) {
+    if (app.textFocused || (mods & kIgnoredMod)) return;
+    if (mods & kShortcutMod) {
         switch (key) {
             case GLFW_KEY_Z: performUndo(app); break;
             case GLFW_KEY_C: copySelection(app); break;
@@ -1763,10 +1764,10 @@ void drawSongs(App& app) {
         const std::string filename = path.filename().string();
         if (!needle.empty() && lowercase(path.string()).find(needle) == std::string::npos) continue;
         const bool selected = app.sample && app.sample->path == path.string();
-        ImGui::PushID(path.c_str());
+        ImGui::PushID(path.string().c_str());
         if (ImGui::Selectable(filename.c_str(), selected)) requestLoad(app, path.string());
         ImGui::PopID();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("%s", path.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("%s", path.string().c_str());
     }
     ImGui::EndChild();
 }
@@ -1818,7 +1819,7 @@ void drawSounds(App& app) {
             }
             if (editable && ImGui::MenuItem("Edit on the timeline")) toEdit = path;
             const bool inUse = timelineUses(app, pathText);
-            if (ImGui::MenuItem("Move to Trash", nullptr, false, !inUse)) toTrash = path;
+            if (ImGui::MenuItem("Move to " AMENITY_TRASH, nullptr, false, !inUse)) toTrash = path;
             if (inUse) ImGui::SetItemTooltip("Used on the timeline");
             ImGui::EndPopup();
         }
@@ -1827,7 +1828,7 @@ void drawSounds(App& app) {
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 0.0f));
             if (ImGui::SmallButton("Edit")) toEdit = path;
             ImGui::PopStyleVar();
-            ImGui::SetItemTooltip("Put this loop's hits back on the timeline to change them. Cmd+Z puts back what was there.");
+            ImGui::SetItemTooltip("Put this loop's hits back on the timeline to change them. " AMENITY_CMD "Z puts back what was there.");
         }
         ImGui::PopID();
     }
@@ -2384,7 +2385,7 @@ void drawTransport(App& app) {
     ImGui::BeginDisabled(app.undo.empty());
     if (ImGui::Button("Undo")) performUndo(app);
     ImGui::EndDisabled();
-    ImGui::SetItemTooltip("Cmd+Z");
+    ImGui::SetItemTooltip(AMENITY_CMD "Z");
 
     if (playing && app.engine->transportBeat() < 0.0) {
         ImGui::SameLine(0.0f, 14.0f);
@@ -2726,16 +2727,16 @@ void drawTimeline(App& app, ImVec2 size) {
         }
     }
     if (ImGui::BeginPopup("hit menu")) {
-        if (ImGui::MenuItem("Copy", "Cmd+C")) copySelection(app);
-        if (ImGui::MenuItem("Cut", "Cmd+X")) cutSelection(app);
-        if (ImGui::MenuItem("Duplicate", "Cmd+D")) duplicateSelection(app);
+        if (ImGui::MenuItem("Copy", AMENITY_CMD "C")) copySelection(app);
+        if (ImGui::MenuItem("Cut", AMENITY_CMD "X")) cutSelection(app);
+        if (ImGui::MenuItem("Duplicate", AMENITY_CMD "D")) duplicateSelection(app);
         ImGui::Separator();
         if (ImGui::MenuItem(app.selection.size() > 1 ? "Delete hits" : "Delete", "Delete")) deleteSelection(app);
         ImGui::EndPopup();
     }
     if (ImGui::BeginPopup("space menu")) {
-        if (ImGui::MenuItem("Paste here", "Cmd+V", false, !app.clipboard.empty())) pasteClipboard(app);
-        if (ImGui::MenuItem("Select all", "Cmd+A", false, !timeline.events.empty())) selectAll(app);
+        if (ImGui::MenuItem("Paste here", AMENITY_CMD "V", false, !app.clipboard.empty())) pasteClipboard(app);
+        if (ImGui::MenuItem("Select all", AMENITY_CMD "A", false, !timeline.events.empty())) selectAll(app);
         if (ImGui::MenuItem("Select none", "Esc", false, !app.selection.empty())) app.selection.clear();
         ImGui::EndPopup();
     }
@@ -2859,7 +2860,7 @@ void drawTimeline(App& app, ImVec2 size) {
 
     if (hoveredEdge || app.dragResize) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
     if (hoveredEvent != 0 && app.dragEvent == 0) {
-        ImGui::SetItemTooltip("Drag to move, Option-drag to copy, Shift-click to add to the selection. "
+        ImGui::SetItemTooltip("Drag to move, " AMENITY_ALT "-drag to copy, Shift-click to add to the selection. "
                               "Drag the right edge to change its length. Right-click for more.");
     } else if (hovered && !inGrid && laneAt(io.MousePos.y) >= 0 && app.dragEvent == 0) {
         ImGui::SetItemTooltip("Click to select all of this sound's hits");
@@ -3062,7 +3063,7 @@ int stepSelfTest(App& app, SelfTest& test, long frame, int width, int height) {
         test.eventsAtStart = app.session.timeline.events.size();
         test.soundsAtStart = app.sounds.size();
         std::printf("at startup: %zu events, %zu sounds, kit key 1: %s\n", test.eventsAtStart, test.soundsAtStart,
-                    app.session.kit().keys[0].empty() ? "empty" : fs::path(app.session.kit().keys[0]).stem().c_str());
+                    app.session.kit().keys[0].empty() ? "empty" : fs::path(app.session.kit().keys[0]).stem().string().c_str());
         app.session.timeline.bpm = 240.0;
         app.session.timeline.bars = 2;
         applyTransportSettings(app);
@@ -3201,8 +3202,8 @@ int stepSelfTest(App& app, SelfTest& test, long frame, int width, int height) {
 
     const auto recorded = app.session.timeline.events;
     tap(GLFW_KEY_ESCAPE);
-    onKey(app, GLFW_KEY_Z, GLFW_PRESS, GLFW_MOD_SUPER);
-    onKey(app, GLFW_KEY_Z, GLFW_RELEASE, GLFW_MOD_SUPER);
+    onKey(app, GLFW_KEY_Z, GLFW_PRESS, kShortcutMod);
+    onKey(app, GLFW_KEY_Z, GLFW_RELEASE, kShortcutMod);
     check(app.session.timeline.events.size() + 1 == test.eventsBeforePlacing + test.placedEvents ||
               test.placedEvents == 0,
           "undo removes the last change");
@@ -3220,12 +3221,12 @@ int stepSelfTest(App& app, SelfTest& test, long frame, int width, int height) {
     const SoundKey first{session.kits[0].keys[0], 0, firstSound->frames};
     addPlacedHit(app, first, 0.0, 1.0f, false);
     selectAll(app);
-    onKey(app, GLFW_KEY_D, GLFW_PRESS, GLFW_MOD_SUPER);
+    onKey(app, GLFW_KEY_D, GLFW_PRESS, kShortcutMod);
     const bool duplicated = timeline.events.size() == 2 && timeline.events[1].beat > 0.0;
     selectAll(app);
-    onKey(app, GLFW_KEY_C, GLFW_PRESS, GLFW_MOD_SUPER);
+    onKey(app, GLFW_KEY_C, GLFW_PRESS, kShortcutMod);
     app.editCursor = 4.0;
-    onKey(app, GLFW_KEY_V, GLFW_PRESS, GLFW_MOD_SUPER);
+    onKey(app, GLFW_KEY_V, GLFW_PRESS, kShortcutMod);
     check(duplicated && timeline.events.size() == 4 && timeline.events[2].beat == 4.0 &&
               timeline.events[3].beat == 4.0 + timeline.events[1].beat,
           "hits can be duplicated, copied and pasted");
@@ -3295,8 +3296,7 @@ int main(int argc, char** argv) {
     }
     const bool selfTesting = !selfTest.capture.empty();
 
-    // Stop macOS from showing the accent popup when a key is held down.
-    CFPreferencesSetAppValue(CFSTR("ApplePressAndHoldEnabled"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+    platform::init();
 
     if (!glfwInit()) {
         std::fprintf(stderr, "Couldn't initialize GLFW\n");
@@ -3322,8 +3322,7 @@ int main(int argc, char** argv) {
     if (selfTesting) app.volume = 0.0f;
     app.engine->setMasterGain(app.volume);
 
-    const char* home = std::getenv("HOME");
-    const fs::path musicRoot = fs::path(home ? home : ".") / "Music";
+    const fs::path musicRoot = platform::homeDir() / "Music";
     if (!dataDirOverride.empty()) {
         app.dataDir = dataDirOverride;
     } else if (selfTesting) {
@@ -3353,8 +3352,8 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    const char* fontPath = "/System/Library/Fonts/Menlo.ttc";
-    if (fs::exists(fontPath)) io.Fonts->AddFontFromFileTTF(fontPath, 14.0f);
+    const fs::path fontPath = platform::uiFontPath();
+    if (!fontPath.empty()) io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 14.0f);
     applyTheme();
 
     // Installed before ImGui's so ImGui chains to them.

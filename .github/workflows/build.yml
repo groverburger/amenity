@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAMENITY_APP_BUNDLE=ON
+          "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ./build/amenity_tests
+      - name: Package
+        run: |
+          mkdir dist
+          mv build/amenity.app dist/Amenity.app
+          codesign --force --deep --sign - dist/Amenity.app
+          lipo -info dist/Amenity.app/Contents/MacOS/amenity
+          ditto -c -k --keepParent dist/Amenity.app Amenity-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Amenity-macOS
+          path: Amenity-macOS.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build
+        run: cmake --build build --config Release -j 4
+      - name: Test
+        run: ./build/Release/amenity_tests.exe
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist/Amenity | Out-Null
+          Copy-Item build/Release/amenity.exe dist/Amenity/Amenity.exe
+          Compress-Archive -Path dist/Amenity -DestinationPath Amenity-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Amenity-Windows
+          path: Amenity-Windows.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" Amenity-macOS.zip Amenity-Windows.zip
+          --repo "$GITHUB_REPOSITORY" --title "Amenity $GITHUB_REF_NAME" --generate-notes
